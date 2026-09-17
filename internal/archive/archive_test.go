@@ -176,6 +176,29 @@ func TestWriterAddVolumeErrorCleansTemp(t *testing.T) {
 	}
 }
 
+func TestWriterRejectsInvalidVolumeName(t *testing.T) {
+	dir := t.TempDir()
+	w, err := NewWriter(dir, "h", testTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	if _, _, err := w.AddVolume("../x", bytes.NewReader(fakeTarStream(1, 10))); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("expected invalid name error, got %v", err)
+	}
+	files, _ := os.ReadDir(dir)
+	// Should only have the .partial file, no temp files
+	tmpCount := 0
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".tmp") {
+			tmpCount++
+		}
+	}
+	if tmpCount != 0 {
+		t.Fatalf("temp file left for invalid name: %v", files)
+	}
+}
+
 func writeTestArchive(t *testing.T, dir string, volumes map[string][]byte) (string, *manifest.Manifest) {
 	t.Helper()
 	w, err := NewWriter(dir, "h", testTime)

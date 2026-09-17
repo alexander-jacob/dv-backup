@@ -76,6 +76,9 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // appends it to the outer tar. It returns the manifest entry and the number of
 // uncompressed bytes read from src.
 func (w *Writer) AddVolume(name string, src io.Reader) (manifest.Entry, int64, error) {
+	if !manifest.ValidName(name) {
+		return manifest.Entry{}, 0, fmt.Errorf("invalid volume name %q", name)
+	}
 	tmp, err := os.CreateTemp(w.dir, ".dv-backup-"+name+"-*.tmp")
 	if err != nil {
 		return manifest.Entry{}, 0, fmt.Errorf("create temp file: %w", err)
