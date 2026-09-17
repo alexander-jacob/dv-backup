@@ -103,15 +103,21 @@ type HelperResult struct {
 }
 
 // BackupHelper streams a GNU tar archive of the volume to stdout.
+//
+// --xattrs-include='*' is required in addition to --xattrs: GNU tar's default
+// xattr filter only includes user.* on extraction (and only excludes a
+// blocklist, not an allowlist, on creation), so without it a security.*
+// xattr such as security.capability is silently dropped. Verified by
+// TestXattrsRoundTrip (spec 10.2).
 func BackupHelper(image, vol string, stdout io.Writer) Helper {
 	return Helper{Image: image, Volume: vol, ReadOnly: true, Entrypoint: "tar",
-		Args: []string{"--numeric-owner", "--xattrs", "--acls", "--sparse", "-C", DataDir, "-cpf", "-", "."}, Stdout: stdout}
+		Args: []string{"--numeric-owner", "--xattrs", "--xattrs-include=*", "--acls", "--sparse", "-C", DataDir, "-cpf", "-", "."}, Stdout: stdout}
 }
 
 // RestoreHelper extracts a GNU tar archive from stdin into the volume.
 func RestoreHelper(image, vol string, stdin io.Reader) Helper {
 	return Helper{Image: image, Volume: vol, Entrypoint: "tar",
-		Args: []string{"--numeric-owner", "--xattrs", "--acls", "-C", DataDir, "-xpf", "-"}, Stdin: stdin}
+		Args: []string{"--numeric-owner", "--xattrs", "--xattrs-include=*", "--acls", "-C", DataDir, "-xpf", "-"}, Stdin: stdin}
 }
 
 // ClearHelper deletes everything inside the volume.
