@@ -83,6 +83,14 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	}
 	defer attach.Close()
 
+	// The hijacked connection is not itself tied to ctx (only the initial
+	// attach request is): cancelling ctx must still unblock a stdin copy
+	// that is stuck writing (e.g. Ctrl-C during a multi-GB restore) or a
+	// StdCopy read that is stuck waiting for more output. Closing the
+	// connection makes both fail promptly instead of hanging.
+	stopOnCancel := context.AfterFunc(ctx, attach.Close)
+	defer stopOnCancel()
+
 	wait := d.c.ContainerWait(ctx, created.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNextExit})
 
 	if _, err := d.c.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
@@ -100,43 +108,76 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 		outDone <- err
 	}()
 
+	// The copy runs in its own goroutine so a cancelled ctx is not ignored
+	// while it is in flight: io.Copy itself has no notion of ctx, and
+	// h.Stdin may be a reader that blocks indefinitely (e.g. a stalled
+	// pipeline). We wait for it when it finishes on its own, but give up
+	// waiting as soon as ctx is done so a Ctrl-C during a multi-GB restore
+	// is not ignored until the whole stream has been sent. stopOnCancel
+	// above already closes attach on cancellation, which unblocks the write
+	// side (attach.Conn) promptly; a still-blocked read from h.Stdin itself
+	// is the caller's reader to abandon, not ours to wait on.
 	var sendErr error
 	if h.Stdin != nil {
-		if _, err := io.Copy(attach.Conn, h.Stdin); err != nil {
-			sendErr = err // tar may have exited early; report after we know its exit code
+		sendDone := make(chan error, 1)
+		go func() {
+			_, err := io.Copy(attach.Conn, h.Stdin)
+			if cwErr := attach.CloseWrite(); err == nil {
+				err = cwErr
+			}
+			sendDone <- err
+		}()
+		select {
+		case sendErr = <-sendDone: // tar may have exited early; report after we know its exit code
+		case <-ctx.Done():
+			sendErr = ctx.Err()
 		}
-		_ = attach.CloseWrite()
 	}
 
-	// Either the output stream ends (container exited) or reading it fails
-	// (e.g. our consumer stopped); in the latter case return so the deferred
-	// force-remove kills the helper instead of letting it block on stdout.
+	// awaitOutput closes the attach connection - unblocking a StdCopy that is
+	// still reading, e.g. after ctx cancellation - and waits for the copy
+	// goroutine to finish. It must run before RunHelper returns on every path
+	// below, so the goroutine can never outlive this call and race the
+	// caller's use of h.Stdout after we hand back control. It is idempotent
+	// (guarded by outDrained) so it is safe to call from more than one path.
 	var outErr error
-	outClosed := false
+	outDrained := false
+	awaitOutput := func() error {
+		if !outDrained {
+			outDrained = true
+			attach.Close()
+			outErr = <-outDone
+		}
+		return outErr
+	}
+
+	// Either the output stream ends (container exited, or ctx cancellation
+	// closed the connection) or the container's wait resolves first; either
+	// way we still need the other result before returning.
 	select {
 	case outErr = <-outDone:
-		outClosed = true
+		outDrained = true
 	case res := <-wait.Result:
-		return d.finish(res, stderr, sendErr, outDone)
+		return d.finish(res, stderr, sendErr, awaitOutput())
 	case err := <-wait.Error:
+		awaitOutput()
 		return HelperResult{}, fmt.Errorf("wait for helper container: %w", err)
 	}
-	if outClosed && outErr != nil && !errors.Is(outErr, io.EOF) {
+	if outErr != nil && !errors.Is(outErr, io.EOF) {
 		return HelperResult{}, fmt.Errorf("read helper output: %w", outErr)
 	}
 	select {
 	case res := <-wait.Result:
 		return d.finish(res, stderr, sendErr, nil)
 	case err := <-wait.Error:
+		awaitOutput()
 		return HelperResult{}, fmt.Errorf("wait for helper container: %w", err)
 	}
 }
 
-func (d *Client) finish(res container.WaitResponse, stderr *tailBuffer, sendErr error, outDone <-chan error) (HelperResult, error) {
-	if outDone != nil {
-		if err := <-outDone; err != nil && !errors.Is(err, io.EOF) {
-			return HelperResult{}, fmt.Errorf("read helper output: %w", err)
-		}
+func (d *Client) finish(res container.WaitResponse, stderr *tailBuffer, sendErr error, outErr error) (HelperResult, error) {
+	if outErr != nil && !errors.Is(outErr, io.EOF) {
+		return HelperResult{}, fmt.Errorf("read helper output: %w", outErr)
 	}
 	if res.Error != nil {
 		return HelperResult{}, fmt.Errorf("helper container: %s", res.Error.Message)

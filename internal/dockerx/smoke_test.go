@@ -6,8 +6,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/moby/moby/client"
 )
@@ -99,10 +101,116 @@ func TestHelperRoundTrip(t *testing.T) {
 	}
 
 	// No helper containers left behind.
-	cs, _ := d.ListContainers(ctx)
+	assertNoStrayHelpers(t, d)
+}
+
+// assertNoStrayHelpers fails the test if any dv-backup helper container is
+// still around. It uses its own context since the caller's ctx may already
+// be cancelled (e.g. in the cancellation tests below).
+func assertNoStrayHelpers(t *testing.T, d *Client) {
+	t.Helper()
+	cs, err := d.ListContainers(context.Background())
+	if err != nil {
+		t.Fatalf("list containers: %v", err)
+	}
 	for _, c := range cs {
 		if c.IsHelper() && strings.Contains(c.Name, "dv-backup-helper-") {
 			t.Fatalf("stray helper %s", c.Name)
 		}
 	}
+}
+
+// slowWriter drains data but sleeps briefly per write, so a large enough
+// stream stays in flight long enough for a cancellation to land mid-copy.
+// Unlike an unread pipe, it never blocks indefinitely, so a bug that fails
+// to react to cancellation shows up as a slow test rather than a hang.
+type slowWriter struct{ delay time.Duration }
+
+func (w slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	return len(p), nil
+}
+
+// TestHelperRestoreCancellation proves that cancelling ctx while RunHelper is
+// sending stdin for a restore (io.Copy blocked forever on a stdin reader
+// that never produces data) makes RunHelper return promptly with an error,
+// and does not leave the helper container behind.
+func TestHelperRestoreCancellation(t *testing.T) {
+	d, err := Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	name := "dv-backup-test-helper-cancel-restore-" + randomHex(4)
+	if err := d.CreateVolume(context.Background(), Volume{Name: name, Driver: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.c.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true}) })
+
+	pr, pw := io.Pipe() // never written to: Read blocks forever
+	t.Cleanup(func() { _ = pw.Close(); _ = pr.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	res, err := d.RunHelper(ctx, RestoreHelper(DefaultImage, name, pr))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected an error after cancellation, got res=%+v", res)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("RunHelper took %v to return after ctx cancellation", elapsed)
+	}
+	assertNoStrayHelpers(t, d)
+}
+
+// TestHelperBackupCancellation proves that cancelling ctx while RunHelper is
+// streaming a backup makes RunHelper return promptly with an error, and does
+// not leave the helper container behind.
+func TestHelperBackupCancellation(t *testing.T) {
+	d, err := Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	name := "dv-backup-test-helper-cancel-backup-" + randomHex(4)
+	if err := d.CreateVolume(context.Background(), Volume{Name: name, Driver: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.c.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true}) })
+
+	// Seed the volume with enough data that streaming it back out takes
+	// noticeably longer than the cancellation delay below.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	payload := bytes.Repeat([]byte("x"), 4<<20) // 4 MiB
+	_ = tw.WriteHeader(&tar.Header{Name: "./big.bin", Mode: 0o640, Size: int64(len(payload)), Typeflag: tar.TypeReg})
+	_, _ = tw.Write(payload)
+	_ = tw.Close()
+	if res, err := d.RunHelper(context.Background(), RestoreHelper(DefaultImage, name, &tarBuf)); err != nil || res.ExitCode != 0 {
+		t.Fatalf("seed restore: res=%+v err=%v", res, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	res, err := d.RunHelper(ctx, BackupHelper(DefaultImage, name, slowWriter{delay: 20 * time.Millisecond}))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("expected an error after cancellation, got res=%+v", res)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("RunHelper took %v to return after ctx cancellation", elapsed)
+	}
+	assertNoStrayHelpers(t, d)
 }
