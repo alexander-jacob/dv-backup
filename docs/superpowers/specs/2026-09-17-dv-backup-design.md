@@ -1,7 +1,7 @@
 # dv-backup — Design
 
 - **Date:** 2026-09-17
-- **Status:** Approved (2026-09-17). Implementation plan not yet written.
+- **Status:** Approved (2026-09-17), revised after review the same day (see 12.1). Implementation plan not yet written.
 - **Repository:** https://github.com/alexander-jacob/dv-backup (public, MIT)
 - **Module path:** `github.com/alexander-jacob/dv-backup`
 
@@ -17,6 +17,8 @@ Recovery workflows it must support:
 before deploy:  taint → apply → scp archive → dv-backup restore → run pipeline
 after deploy:   taint → apply → run pipeline (or compose up --no-start) → scp archive → dv-backup restore [--force] → start stack
 ```
+
+In the after-deploy flow `--force` is normally required, even with `compose up --no-start`: Docker copies image content into a new volume at container **create** time (verified, see 10.1), and database images initialise their data directory on first start. The help text must say so.
 
 ## 2. Goals and non-goals
 
@@ -54,7 +56,7 @@ dv-backup <command> [options]
       -p, --project <name>      Only volumes of this Compose project (repeatable)
       --force                   Overwrite volumes that contain data or are in use;
                                 stops and restarts the containers using them
-      --verify-only             Verify manifest and checksums, change nothing
+      --verify-only             Verify manifest and checksums, change nothing (works without Docker)
 
   Global:
       --image <ref>             Helper image (env DV_BACKUP_IMAGE, default debian:13-slim)
@@ -64,7 +66,13 @@ dv-backup <command> [options]
 
 - `--help`, `-h` and running without arguments print usage. Every command has its own `--help` (cobra).
 - `--project` and volume names combine as a union filter; a name that matches nothing is an error.
-- Archive file name: `dv-backup-<hostname>-<UTC yyyymmddThhmmssZ>.tar`, e.g. `dv-backup-vm-app-01-20260917T120000Z.tar`.
+- Archive file name: `dv-backup-<hostname>-<UTC yyyymmddThhmmssZ>.tar`, e.g. `dv-backup-vm-app-01-20260917T120000Z.tar`. `backup` refuses to run if that `.tar` or its `.partial` already exists (create with `O_EXCL`); it never overwrites.
+
+### Output
+
+- Human-readable text; tables for `stat`, one line per step otherwise. Errors and warnings go to stderr, everything else to stdout. No `--json` or `--quiet` in v1.
+- `backup` and `restore` print one line when a volume starts and one when it finishes (uncompressed and compressed size, elapsed time), plus a line per container stopped and restarted. Volumes can be many GB, so the start line must appear before the data is streamed. No byte-level progress bar in v1.
+- `restore` prints the plan (volume, current state, action, reason) before executing it, and again with the outcome per volume (restored / failed / untouched) when it stops early.
 
 ## 4. Architecture
 
@@ -97,7 +105,7 @@ empty?:   docker run --rm -v <vol>:/data:ro <image> find /data -mindepth 1 -maxd
 
 Implemented via the Docker API (create, attach stdout/stdin, start, wait for exit code, remove), not by shelling out to the `docker` CLI. Non-zero exit codes and stderr output of the helper are surfaced as errors.
 
-- Default image `debian:13-slim` (GNU tar), overridable with `--image` / `DV_BACKUP_IMAGE` (e.g. for a private registry mirror). The image is pulled if missing. The resolved image digest is recorded in the manifest.
+- Default image `debian:13-slim` (verified 2026-09-17: GNU tar 1.35 with `--acls`, `--xattrs`, `--selinux`, `--sparse`; findutils 4.10), overridable with `--image` / `DV_BACKUP_IMAGE` (e.g. for a private registry mirror). The image is pulled **anonymously** if missing; the Docker API does not read `~/.docker/config.json`, so for a registry that needs credentials the operator must `docker pull` the image first. The README and the pull error message must say so. The resolved image digest is recorded in the manifest.
 
 ### Why not Docker's copy API (`CopyFromContainer`/`CopyToContainer`)
 
@@ -116,7 +124,7 @@ GNU tar is the only fully faithful variant; the extra runtime (seconds per volum
 Outer file: uncompressed tar.
 
 ```
-volumes/<volume>.tar.zst    one per volume: GNU tar stream, zstd level 3
+volumes/<volume>.tar.zst    one per volume: GNU tar stream, zstd (klauspost `SpeedDefault`, equivalent to `zstd -3`)
 manifest.yaml               written after all volumes (needs sizes and checksums)
 README.md                   human-readable rendering of the manifest
 ```
@@ -163,19 +171,21 @@ Principle: check everything first, then change things; never leave a state that 
 
 ### 7.1 stat
 
-- Live: table of named volumes (name, Compose project, driver, size, containers with running/stopped state). Sizes come from the Docker disk-usage API. Warnings section lists anonymous volumes and writable bind mounts of existing containers, both "not backed up".
+- Live: table of named volumes (name, Compose project, driver, size, containers with their state). Sizes come from the Docker disk-usage API (measured 2026-09-17: 7 s for 645 volumes, acceptable). Helper containers of dv-backup (label `dv-backup.helper`) are never listed as users of a volume. Warnings section lists anonymous volumes, writable bind mounts of existing containers (both "not backed up") and stray dv-backup helper containers with the command to remove them.
 - `--archive`: archive metadata, volume table (name, project, uncompressed size, compressed size, consistent flag), and a warning line for each inconsistent volume.
 
 ### 7.2 backup
 
 1. **Preflight:** Docker reachable; helper image available (pull if missing); output directory writable; warn if the sum of volume sizes exceeds free space in the output directory.
 2. **Select:** named volumes, filtered by `--project` / names. Nothing selected → error, no file written.
-3. **Stop** (unless `--no-stop`): collect all *running* containers using any selected volume; stop each once, with its own configured stop timeout; remember the list.
+3. **Stop** (unless `--no-stop`): collect all *in-use* containers using any selected volume; stop each once, with its own configured stop timeout; remember the list. **In use** means `State` is `running`, `paused` or `restarting`: a restarting (crash-looping) container writes between restarts, a paused one holds files open and resumes writing after unpause. `docker stop` handles all three (verified on 29.8.1: a paused container stops cleanly and ends up `exited`). Stopped containers come back `running`; a previously paused container is not re-paused. This is documented.
 4. **Archive:** write to `<name>.tar.partial`; for each volume stream helper-tar → zstd → sha256 → temp file → outer tar. After all volumes, write `manifest.yaml` and `README.md`, close, rename to `<name>.tar`.
 5. **Any volume failure fails the whole backup**: remove `.partial` and temp files, exit non-zero.
 6. **Always restart** exactly the containers stopped in step 3 — on success, error, `SIGINT` or `SIGTERM` — using a context that is not the cancelled one, in ascending order of their original `State.StartedAt` (so dependencies started earlier come back first). Remove helper containers. Restart failures are reported per container and produce exit code 3.
 
-A `SIGKILL` of `dv-backup` cannot be handled; containers may remain stopped. This is documented.
+Restart does not wait for health checks. An application container that is started before its database is ready may exit and only recovers through its own restart policy. This is documented as a limitation.
+
+A `SIGKILL` of `dv-backup` cannot be handled; containers may remain stopped and a helper container may remain. This is documented, together with the cleanup commands (`docker start` of the containers listed in the output, `docker rm -f $(docker ps -aq --filter label=dv-backup.helper)`).
 
 ### 7.3 restore
 
@@ -185,14 +195,15 @@ A `SIGKILL` of `dv-backup` cannot be handled; containers may remain stopped. Thi
    | Target state | Without `--force` | With `--force` |
    |---|---|---|
    | missing | create + unpack | create + unpack |
-   | exists, empty, not used by running container | unpack | unpack |
-   | exists, has data | **blocked** | stop running containers using it, clear, unpack |
-   | used by a running container | **blocked** | stop running containers using it, clear, unpack |
+   | exists, empty, not in use | unpack | unpack |
+   | exists, has data | **blocked** | stop in-use containers using it, clear, unpack |
+   | in use (container `running`, `paused` or `restarting`) | **blocked** | stop in-use containers using it, clear, unpack |
 
-   If any selected volume is blocked, print the full plan with reasons and exit 1 **without changing anything**.
-3. **Execute** per volume in manifest order: create with driver, driver options and labels from the manifest when missing; if the volume exists and its labels differ from the manifest, warn (labels cannot be changed on existing volumes). Stopping, clearing and unpacking as planned.
-4. **Failure mid-restore:** stop processing, print restored / failed / untouched volumes and the exact command to retry the failed and untouched ones with `--force`.
-5. **Always restart** containers stopped in step 3, same rules as backup.
+   "In use" has the same meaning as in backup step 3. If any selected volume is blocked, print the full plan with reasons and exit 1 **without changing anything**. If a volume exists and its driver, driver options or labels differ from the manifest, the plan shows a warning (these cannot be changed on an existing volume); this does not block.
+3. **Stop** all containers the plan marks for stopping, before the first volume is changed (same rules as backup step 3); remember the list.
+4. **Execute** per volume in manifest order: create with driver, driver options and labels from the manifest when missing; clear and unpack as planned.
+5. **Failure mid-restore:** stop processing, print restored / failed / untouched volumes and the exact command to retry the failed and untouched ones with `--force`.
+6. **Always restart** containers stopped in step 3, same rules as backup step 6.
 
 ### 7.4 Exit codes
 
@@ -211,15 +222,20 @@ A `SIGKILL` of `dv-backup` cannot be handled; containers may remain stopped. Thi
 - backup stop/restart bookkeeping on success, error and context cancellation
 - outer archive round trip, sha256 mismatch detection, `.partial` cleanup
 - selection filters (`--project`, names, unknown names)
+- restart ordering by `StartedAt`; "in use" classification for `running`, `paused`, `restarting`, `exited`, `created`
+- `--no-stop` with helper exit code 1 → warning and `consistent: false`; exit code 2 → failure
+- archive created with mode `0600`; refusal when the target file exists
 
 **Integration tests** (build tag `integration`, real Docker, resources named `dv-backup-test-<random>`, cleaned up with `t.Cleanup`):
 - round trip of the spike's edge-case volume with the spike's metadata comparison (ownership, modes, setgid/sticky, symlinks, hardlinks, FIFO, unicode, mtimes, sparse allocation)
 - Compose labels present on restored volumes
 - running container is stopped, backed up and restarted; also when the backup fails
+- paused container is stopped, backed up and comes back running
 - `SIGINT` during backup (binary as subprocess): containers restarted, no `.tar` or `.partial` left
 - corrupted archive: restore refuses before any Docker change
 - blocked plan without `--force`; overwrite with `--force`
-- restore after `docker compose up --no-start` (see open question 10.1)
+- restore after `docker compose up --no-start` into a volume populated by image copy-up: blocked without `--force`, succeeds with it (see 10.1)
+- xattrs: a `user.*` key and, where the kernel allows it in the test environment, `security.capability` on a file, both present after restore (see 10.2)
 
 ## 9. CI and release
 
@@ -231,11 +247,15 @@ Repository files: `README.md`, `LICENSE` (MIT), `go.mod`, `.golangci.yml`, `.gor
 
 ## 10. Open questions and known limitations
 
-1. **Image content copy-up timing:** when an image has files at a volume's mount path, Docker copies them into a new empty volume. It is not verified whether this happens at container *create* or first *start*. If at create, restore after `compose up --no-start` sees a non-empty volume and requires `--force`. To be settled by the integration test and documented in `--help`.
-2. **xattrs/ACLs:** requested from GNU tar but not covered by the spike; the integration test adds a `user.*` xattr where the filesystem supports it.
+1. **Image content copy-up timing — settled (2026-09-17, Docker 29.8.1):** when an image has files at a volume's mount path, Docker copies them into a new empty named volume at container **create** time, before any start (verified with `docker create` of `nginx:alpine` mounting a fresh volume at `/usr/share/nginx/html`: the volume held `index.html` and `50x.html` without the container ever starting). Consequently restore after `compose up --no-start` sees a non-empty volume for such images and requires `--force`. Documented in `--help` and README; the integration test covers it.
+2. **xattrs/ACLs:** requested from GNU tar but not covered by the spike; the integration test adds a `user.*` xattr and a `security.capability` xattr where the filesystem and kernel support it. Not verified: whether GNU tar's `--xattrs` on extraction restores `security.*` and `system.*` keys by default or only `user.*`; if not, add `--xattrs-include='*'` on restore and re-test.
 3. **Bind mounts and anonymous volumes** are not backed up (reported by `stat` only).
 4. **Consistency with `--no-stop`** is not guaranteed; flagged in manifest and `stat --archive`.
 5. **Helper image tag** `debian:13-slim` must be bumped when Debian 13 reaches end of life.
+6. **Compose `external: true` volumes** carry no Compose labels, so `--project` never selects them; they must be named explicitly or included via an unfiltered backup. Documented.
+7. **No dependency wait on restart** (see 7.2 step 6).
+8. **Linux daemons only.** Windows containers are not supported.
+9. **Docker volume name pattern:** Docker's pattern lives in daemon code (`daemon/names`), not in the api or client modules, and could not be checked. The spec's pattern requires at least two characters; the implementer must confirm on a scratch daemon whether one-character names are accepted (`docker volume create a` on the workstation is **not** allowed: a volume `a` may already exist) and adjust the read-side validation so that no valid Docker name is rejected.
 
 ## 11. Implementation notes (verified facts for a fresh implementer)
 
@@ -247,7 +267,7 @@ Everything in this section was checked on 2026-09-17 with `go doc` against the l
 - This client uses an *options struct in, result struct out* style for almost every call. Verified signatures:
 
   ```go
-  client.New(client.FromEnv)                                                          // honours DOCKER_HOST etc.
+  client.New(client.FromEnv)                                                          // honours DOCKER_HOST etc.; negotiates API version by default
   (*Client).Close() error
   (*Client).Info(ctx, client.InfoOptions{}) (client.SystemInfoResult, error)          // .Info.Name = daemon hostname
   (*Client).ServerVersion(ctx, client.ServerVersionOptions{}) (client.ServerVersionResult, error) // .Version
@@ -263,13 +283,13 @@ Everything in this section was checked on 2026-09-17 with `go doc` against the l
   (*Client).ContainerAttach(ctx, id, client.ContainerAttachOptions{Stream, Stdin, Stdout, Stderr}) (client.ContainerAttachResult, error)
   (*Client).ContainerWait(ctx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNextExit}) client.ContainerWaitResult // .Result <-chan container.WaitResponse, .Error <-chan error
   (*Client).ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true})
-  (*Client).ImageInspect(ctx, ref) (client.ImageInspectResult, error)                // embeds image.InspectResponse (.RepoDigests)
-  (*Client).ImagePull(ctx, ref, client.ImagePullOptions{}) (client.ImagePullResponse, error) // call .Wait(ctx)
+  (*Client).ImageInspect(ctx, ref, ...client.ImageInspectOption) (client.ImageInspectResult, error) // embeds image.InspectResponse (.RepoDigests)
+  (*Client).ImagePull(ctx, ref, client.ImagePullOptions{}) (client.ImagePullResponse, error) // call .Wait(ctx); RegistryAuth left empty (anonymous pull, see §5)
   ```
 
 - `client.Filters` is `map[string]map[string]bool`; build with `make(client.Filters).Add("volume", name)`.
 - `container.Summary.Mounts []container.MountPoint` has `Type`, `Name` (volume name), `Source`, `Destination`, `RW` — enough to find volume users and writable bind mounts without inspecting each container.
-- `ContainerList` filter `volume=<name>` returns containers mounting that volume. Use `All: true`, then check `State == container.StateRunning` (`"running"`).
+- `ContainerList` filter `volume=<name>` returns containers mounting that volume. Use `All: true`, then classify by `State`: `running`, `paused`, `restarting` are "in use" (see 7.2 step 3); everything else is not. Exclude containers with label `dv-backup.helper`.
 - Demultiplex attached output with `stdcopy.StdCopy(stdout, stderr, reader)` from **`github.com/moby/moby/api/pkg/stdcopy`** (not `client/pkg/stdcopy`, which does not exist).
 
 ### 11.2 Helper container recipe
@@ -307,7 +327,7 @@ GNU tar exit codes: `0` success; `1` means files changed while being read (with 
 
 ### 11.4 Other decisions fixed for implementation
 
-- **Host name** in manifest and file name: the Docker daemon's `Info.Name`, not `os.Hostname()`. It must describe the Docker host even with a remote `DOCKER_HOST`.
+- **Host name** in manifest and file name: the Docker daemon's `Info.Name` (verified: returns the daemon's hostname), not `os.Hostname()`. It must describe the Docker host even with a remote `DOCKER_HOST`.
 - **Archive file permissions:** `0600`. Volume data often contains secrets (database contents, credentials). The README must state that archives are **not encrypted**.
 - **Temporary files:** `<output-dir>/.dv-backup-<volume>-<random>.tmp`, removed on success and failure.
 - **Filename sanitising:** Docker host names are safe for file names; still, replace any character outside `[A-Za-z0-9._-]` with `-`.
@@ -339,6 +359,12 @@ These were debated and settled with the maintainer. Do not reopen them without n
 | Local file in/out, transport by operator | Azure Blob, Azure Files, GitLab | Maintainer copies archives with `scp`. |
 | Public on GitHub, MIT | internal GitLab; Apache-2.0; GPL-3.0 | Open source; MIT is shortest for a small CLI. |
 | Name `dv-backup` ("docker volume backup") | `dc-backup` | Renamed by maintainer. |
+| Anonymous image pull only | read `~/.docker/config.json` credential store | The Docker API does not apply CLI credentials; reading the credential store (and credential helpers) adds a dependency for a rare case. Operator pre-pulls instead. |
+| `paused` and `restarting` count as in use | only `running` | Both can write to the volume; `docker stop` handles them (verified). |
+
+### 12.1 Review revisions (2026-09-17)
+
+An independent review after approval led to these changes: copy-up timing settled (10.1); `paused`/`restarting` treated as in use (7.2, 7.3, 11.1); restore stops all containers before changing volumes (7.3); anonymous image pull and pre-pull requirement (5); output and progress specified (3); refusal to overwrite an existing archive (3); `--verify-only` works without Docker (3); driver/driver-option mismatch warning (7.3); no dependency wait on restart, helper cleanup and Linux-only limitations (7.2, 10); external Compose volumes (10); zstd level naming (6); additional tests (8); unverified items listed under 10.2 and 10.9.
 
 ## Appendix A: Spike fixture scripts
 
