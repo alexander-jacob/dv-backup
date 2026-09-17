@@ -40,17 +40,17 @@ func writeArchive(t *testing.T, dir string, contents map[string]string) string {
 	return w.Path()
 }
 
-func run(t *testing.T, f *dockerx.Fake, opts Options) (Result, string, string, error) {
+func run(t *testing.T, f *dockerx.Fake, opts Options) (Result, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	res, err := Run(context.Background(), f, &out, &errOut, opts)
-	return res, out.String(), errOut.String(), err
+	return res, out.String(), err
 }
 
 func TestRestoreFreshHost(t *testing.T) {
 	path := writeArchive(t, t.TempDir(), map[string]string{"app_db": "DB", "app_files": "FILES"})
 	f := dockerx.NewFake()
-	res, out, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
+	res, out, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestRestoreBlockedWithoutForce(t *testing.T) {
 	f := dockerx.NewFake()
 	f.AddVolume(dockerx.Volume{Name: "app_db", Driver: "local"}, []byte("OLD"))
 	f.AddContainer(dockerx.Container{ID: "c", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
-	_, out, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
+	_, out, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
 	if !errors.Is(err, ErrBlocked) {
 		t.Fatalf("err = %v", err)
 	}
@@ -110,7 +110,7 @@ func TestRestoreForceOverwrites(t *testing.T) {
 	f.AddVolume(dockerx.Volume{Name: "app_db", Driver: "local"}, []byte("OLD"))
 	f.AddVolume(dockerx.Volume{Name: "app_files", Driver: "local"}, nil)
 	f.AddContainer(dockerx.Container{ID: "c", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
-	res, _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
+	res, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestRestoreStopFailure(t *testing.T) {
 	f.AddContainer(dockerx.Container{ID: "c1", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
 	f.AddContainer(dockerx.Container{ID: "c2", Name: "app-files-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_files"}}})
 	f.FailStop["c2"] = errors.New("stop failed")
-	res, out, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
+	res, out, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
 	if err == nil || !strings.Contains(err.Error(), "stop failed") {
 		t.Fatalf("err = %v", err)
 	}
@@ -157,13 +157,13 @@ func TestRestoreStopFailure(t *testing.T) {
 func TestRestoreSelectionAndUnknownName(t *testing.T) {
 	path := writeArchive(t, t.TempDir(), map[string]string{"app_db": "DB", "app_files": "FILES"})
 	f := dockerx.NewFake()
-	if _, _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Names: []string{"app_files"}}); err != nil {
+	if _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Names: []string{"app_files"}}); err != nil {
 		t.Fatal(err)
 	}
 	if f.Data["app_db"] != nil || string(f.Data["app_files"]) != "FILES" {
 		t.Fatal("only app_files should be restored")
 	}
-	if _, _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Names: []string{"nope"}}); err == nil || !strings.Contains(err.Error(), "nope") {
+	if _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Names: []string{"nope"}}); err == nil || !strings.Contains(err.Error(), "nope") {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -174,7 +174,7 @@ func TestRestoreFailureMidWay(t *testing.T) {
 	f.AddVolume(dockerx.Volume{Name: "app_db", Driver: "local"}, nil)
 	f.AddContainer(dockerx.Container{ID: "c", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
 	f.FailHelper["tar app_db"] = errors.New("disk on fire")
-	res, out, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
+	res, out, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -202,7 +202,7 @@ func TestRestoreCorruptArchiveChangesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := dockerx.NewFake()
-	_, _, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
+	_, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage})
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("err = %v", err)
 	}

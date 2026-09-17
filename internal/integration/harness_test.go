@@ -116,8 +116,8 @@ func (h *harness) sh(vol, script string) string {
 func (h *harness) populate(vol string)        { h.sh(vol, populateScript) }
 func (h *harness) listing(vol string) string { return h.sh(vol, inspectScript) }
 
-// container creates (and optionally starts) a sleeping container that mounts vol.
-func (h *harness) container(vol string, start bool, labels map[string]string) string {
+// container creates and starts a sleeping container that mounts vol.
+func (h *harness) container(vol string, labels map[string]string) string {
 	name := h.name()
 	if !strings.HasPrefix(name, prefix) {
 		h.t.Fatal("bad name")
@@ -133,10 +133,8 @@ func (h *harness) container(vol string, start bool, labels map[string]string) st
 	h.t.Cleanup(func() {
 		_, _ = h.raw.ContainerRemove(context.Background(), res.ID, client.ContainerRemoveOptions{Force: true})
 	})
-	if start {
-		if _, err := h.raw.ContainerStart(h.ctx, res.ID, client.ContainerStartOptions{}); err != nil {
-			h.t.Fatal(err)
-		}
+	if _, err := h.raw.ContainerStart(h.ctx, res.ID, client.ContainerStartOptions{}); err != nil {
+		h.t.Fatal(err)
 	}
 	return res.ID
 }
@@ -166,11 +164,11 @@ func (h *harness) backup(dir string, vols ...string) (backup.Result, string, err
 	return res, out.String() + errOut.String(), err
 }
 
-func (h *harness) restore(path string, force bool, vols ...string) (restore.Result, string, error) {
+func (h *harness) restore(path string, force bool, vols ...string) (string, error) {
 	if len(vols) == 0 {
 		h.t.Fatal("integration tests must always pass explicit volume names to restore")
 	}
 	var out, errOut bytes.Buffer
-	res, err := restore.Run(h.ctx, h.d, &out, &errOut, restore.Options{Archive: path, Names: vols, Force: force, Image: dockerx.DefaultImage})
-	return res, out.String() + errOut.String(), err
+	_, err := restore.Run(h.ctx, h.d, &out, &errOut, restore.Options{Archive: path, Names: vols, Force: force, Image: dockerx.DefaultImage})
+	return out.String() + errOut.String(), err
 }

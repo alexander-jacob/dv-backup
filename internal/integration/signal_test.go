@@ -22,7 +22,7 @@ func TestSIGINTDuringBackupRestartsAndCleans(t *testing.T) {
 	}
 	vol := h.volume(nil)
 	h.sh(vol, "head -c 600M /dev/urandom > /data/big.bin") // incompressible, takes a few seconds to stream
-	id := h.container(vol, true, nil)
+	id := h.container(vol, nil)
 
 	outDir := t.TempDir()
 	cmd := exec.Command(bin, "backup", "-o", outDir, vol)

@@ -36,7 +36,7 @@ func TestCorruptArchiveRefusedBeforeAnyChange(t *testing.T) {
 	if err := os.WriteFile(res.Path, b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.restore(res.Path, false, vol); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+	if _, err := h.restore(res.Path, false, vol); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("err = %v", err)
 	}
 	if _, ok, _ := h.d.InspectVolume(h.ctx, vol); ok {
@@ -53,9 +53,9 @@ func TestBlockedThenForced(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	h.sh(vol, "rm /data/f && echo old > /data/g")
-	id := h.container(vol, true, nil)
+	id := h.container(vol, nil)
 
-	_, out, err = h.restore(res.Path, false, vol)
+	out, err = h.restore(res.Path, false, vol)
 	if !errors.Is(err, restore.ErrBlocked) {
 		t.Fatalf("err = %v\n%s", err, out)
 	}
@@ -63,7 +63,7 @@ func TestBlockedThenForced(t *testing.T) {
 		t.Fatal("blocked restore changed the volume")
 	}
 
-	_, out, err = h.restore(res.Path, true, vol)
+	out, err = h.restore(res.Path, true, vol)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -112,10 +112,10 @@ func TestRestoreAfterCreateNoStartNeedsForce(t *testing.T) {
 	// dv-backup-test-* resources.
 	t.Cleanup(func() { _, _ = h.raw.ContainerRemove(context.Background(), c.ID, client.ContainerRemoveOptions{Force: true}) })
 
-	if _, _, err := h.restore(res.Path, false, vol); !errors.Is(err, restore.ErrBlocked) {
+	if _, err := h.restore(res.Path, false, vol); !errors.Is(err, restore.ErrBlocked) {
 		t.Fatalf("expected blocked (copy-up made the volume non-empty), got %v", err)
 	}
-	if _, out, err := h.restore(res.Path, true, vol); err != nil {
+	if out, err := h.restore(res.Path, true, vol); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	if h.sh(vol, "cat /data/index.html") != "mine\n" || strings.Contains(h.sh(vol, "ls /data"), "50x.html") {

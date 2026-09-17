@@ -17,7 +17,7 @@ func TestRunningContainerStoppedAndRestarted(t *testing.T) {
 	h := newHarness(t)
 	vol := h.volume(nil)
 	h.sh(vol, "echo data > /data/f")
-	id := h.container(vol, true, map[string]string{"com.docker.compose.service": "web"})
+	id := h.container(vol, map[string]string{"com.docker.compose.service": "web"})
 	firstStart := h.startedAt(id)
 
 	res, out, err := h.backup(t.TempDir(), vol)
@@ -51,7 +51,7 @@ func TestFailedBackupStillRestarts(t *testing.T) {
 		t.Fatalf("pull hello-world: %v", err)
 	}
 	vol := h.volume(nil)
-	id := h.container(vol, true, nil)
+	id := h.container(vol, nil)
 	firstStart := h.startedAt(id)
 	var out, errOut strings.Builder
 	// hello-world has no tar binary: the helper fails to start.
@@ -70,7 +70,7 @@ func TestFailedBackupStillRestarts(t *testing.T) {
 func TestPausedContainerIsStoppedAndComesBackRunning(t *testing.T) {
 	h := newHarness(t)
 	vol := h.volume(nil)
-	id := h.container(vol, true, nil)
+	id := h.container(vol, nil)
 	if _, err := h.raw.ContainerPause(h.ctx, id, client.ContainerPauseOptions{}); err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,7 @@ func TestRoundTripFidelity(t *testing.T) {
 	if _, err := h.raw.VolumeRemove(h.ctx, vol, client.VolumeRemoveOptions{Force: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, out, err := h.restore(res.Path, false, vol); err != nil {
+	if out, err := h.restore(res.Path, false, vol); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	after := h.listing(vol)

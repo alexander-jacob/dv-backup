@@ -182,7 +182,7 @@ func TestWriterRejectsInvalidVolumeName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer w.Abort()
+	defer func() { _ = w.Abort() }()
 	if _, _, err := w.AddVolume("../x", bytes.NewReader(fakeTarStream(1, 10))); err == nil || !strings.Contains(err.Error(), "invalid") {
 		t.Fatalf("expected invalid name error, got %v", err)
 	}
@@ -199,7 +199,7 @@ func TestWriterRejectsInvalidVolumeName(t *testing.T) {
 	}
 }
 
-func writeTestArchive(t *testing.T, dir string, volumes map[string][]byte) (string, *manifest.Manifest) {
+func writeTestArchive(t *testing.T, dir string, volumes map[string][]byte) string {
 	t.Helper()
 	w, err := NewWriter(dir, "h", testTime)
 	if err != nil {
@@ -216,12 +216,12 @@ func writeTestArchive(t *testing.T, dir string, volumes map[string][]byte) (stri
 	if err := w.Finish(m); err != nil {
 		t.Fatal(err)
 	}
-	return w.Path(), m
+	return w.Path()
 }
 
 func TestReaderRoundTrip(t *testing.T) {
 	a, b := fakeTarStream(1, 50_000), fakeTarStream(9, 10)
-	path, _ := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": a, "vol_b": b})
+	path := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": a, "vol_b": b})
 	r, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -250,7 +250,7 @@ func TestReaderRoundTrip(t *testing.T) {
 }
 
 func TestReaderDetectsCorruption(t *testing.T) {
-	path, _ := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": fakeTarStream(1, 50_000)})
+	path := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": fakeTarStream(1, 50_000)})
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)

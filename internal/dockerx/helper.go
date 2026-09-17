@@ -170,7 +170,7 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	case res := <-wait.Result:
 		return d.finish(res, stderr, sendErr, awaitOutput())
 	case err := <-wait.Error:
-		awaitOutput()
+		_ = awaitOutput()
 		return HelperResult{}, fmt.Errorf("wait for helper container: %w", err)
 	}
 	if outErr != nil && !errors.Is(outErr, io.EOF) {
@@ -180,7 +180,7 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	case res := <-wait.Result:
 		return d.finish(res, stderr, sendErr, nil)
 	case err := <-wait.Error:
-		awaitOutput()
+		_ = awaitOutput()
 		return HelperResult{}, fmt.Errorf("wait for helper container: %w", err)
 	}
 }
