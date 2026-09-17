@@ -2,7 +2,6 @@ package dockerx
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -179,8 +178,3 @@ func pullError(ref string, err error) error {
 
 // RunHelper is implemented in helper.go.
 var _ Docker = (*Client)(nil)
-
-var errNotImplemented = errors.New("not implemented")
-
-// RunHelper is replaced in Task 8.
-func (d *Client) RunHelper(context.Context, Helper) (HelperResult, error) { return HelperResult{}, errNotImplemented }
