@@ -64,7 +64,9 @@ func Host(ctx context.Context, d dockerx.Docker, out io.Writer) error {
 	var stray []string
 	for _, c := range containers {
 		if c.IsHelper() {
-			stray = append(stray, c.Name)
+			if !c.InUse() {
+				stray = append(stray, c.Name)
+			}
 			continue
 		}
 		for _, m := range c.Mounts {
@@ -77,12 +79,7 @@ func Host(ctx context.Context, d dockerx.Docker, out io.Writer) error {
 		sort.Strings(stray)
 		warnings = append(warnings, fmt.Sprintf("stray helper container(s) %s from an interrupted run; remove with: docker rm -f $(docker ps -aq --filter label=%s=true)", strings.Join(stray, ", "), dockerx.LabelHelper))
 	}
-	if len(warnings) > 0 {
-		fmt.Fprintln(out, "\nwarnings:")
-		for _, w := range warnings {
-			fmt.Fprintf(out, "  - %s\n", w)
-		}
-	}
+	printWarnings(out, warnings)
 	return nil
 }
 
@@ -93,6 +90,15 @@ func skipBind(source string) bool {
 		}
 	}
 	return false
+}
+
+func printWarnings(out io.Writer, warnings []string) {
+	if len(warnings) > 0 {
+		fmt.Fprintln(out, "\nwarnings:")
+		for _, w := range warnings {
+			fmt.Fprintf(out, "  - %s\n", w)
+		}
+	}
 }
 
 // Archive prints the manifest of an archive without reading volume data.
@@ -117,11 +123,6 @@ func Archive(path string, out io.Writer) error {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", v.Name, v.Project(), manifest.FormatBytes(v.SizeBytes), manifest.FormatBytes(v.Archive.SizeBytes), cons, v.Archive.SHA256)
 	}
 	tw.Flush()
-	if len(warnings) > 0 {
-		fmt.Fprintln(out, "\nwarnings:")
-		for _, w := range warnings {
-			fmt.Fprintf(out, "  - %s\n", w)
-		}
-	}
+	printWarnings(out, warnings)
 	return nil
 }

@@ -21,6 +21,7 @@ func TestHost(t *testing.T) {
 	f.AddContainer(dockerx.Container{ID: "c1", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}, {Type: "bind", Source: "/srv/data", Destination: "/data", RW: true}, {Type: "bind", Source: "/var/run/docker.sock", Destination: "/var/run/docker.sock", RW: true}}})
 	f.AddContainer(dockerx.Container{ID: "c2", Name: "app-web-1", State: dockerx.StateExited, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
 	f.AddContainer(dockerx.Container{ID: "h", Name: "dv-backup-helper-dead", State: dockerx.StateExited, Labels: map[string]string{dockerx.LabelHelper: "true"}, Mounts: []dockerx.Mount{{Type: "volume", Name: "plain"}}})
+	f.AddContainer(dockerx.Container{ID: "h-running", Name: "dv-backup-helper-active", State: dockerx.StateRunning, Labels: map[string]string{dockerx.LabelHelper: "true"}, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
 	var out bytes.Buffer
 	if err := Host(context.Background(), f, &out); err != nil {
 		t.Fatal(err)
@@ -37,6 +38,9 @@ func TestHost(t *testing.T) {
 	}
 	if strings.Contains(s, "dv-backup-helper-dead (exited)") {
 		t.Errorf("helper must not be listed as a volume user:\n%s", s)
+	}
+	if strings.Contains(s, "dv-backup-helper-active") {
+		t.Errorf("running helper must not be listed as stray:\n%s", s)
 	}
 }
 
