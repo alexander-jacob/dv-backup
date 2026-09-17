@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,7 +175,7 @@ func TestBackupRestartFailureIsReported(t *testing.T) {
 	}
 }
 
-func TestBackupCancelledContextStillRestarts(t *testing.T) {
+func TestBackupCancelledBeforeStart(t *testing.T) {
 	f, opts := setup(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -182,12 +183,52 @@ func TestBackupCancelledContextStillRestarts(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
 	}
-	calls := strings.Join(f.Calls, " ")
-	if strings.Contains(calls, "stop db") && !strings.Contains(calls, "start db") {
-		t.Fatalf("stopped but not restarted: %v", f.Calls)
+	if len(f.Calls) != 0 {
+		t.Fatalf("nothing should have been touched: %v", f.Calls)
 	}
 	entries, _ := os.ReadDir(opts.OutputDir)
 	if len(entries) != 0 {
 		t.Fatalf("output dir not clean: %v", entries)
+	}
+}
+
+// cancelOnWrite calls cancel the first time a write to it contains trigger,
+// after forwarding the write to the wrapped writer. It lets a test cancel a
+// context from inside a running backup, at a precise point in its output.
+type cancelOnWrite struct {
+	io.Writer
+	trigger string
+	cancel  func()
+	fired   bool
+}
+
+func (w *cancelOnWrite) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if !w.fired && strings.Contains(string(p), w.trigger) {
+		w.fired = true
+		w.cancel()
+	}
+	return n, err
+}
+
+func TestBackupCancelledMidRunStillRestarts(t *testing.T) {
+	f, opts := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out bytes.Buffer
+	cw := &cancelOnWrite{Writer: &out, trigger: "backing up volume app_files", cancel: cancel}
+	_, err := Run(ctx, f, cw, &bytes.Buffer{}, opts)
+	if err == nil {
+		t.Fatal("expected error from cancellation mid-run")
+	}
+	calls := strings.Join(f.Calls, " ")
+	stopAt := strings.Index(calls, "stop db")
+	startAt := strings.Index(calls, "start db")
+	if stopAt < 0 || startAt < 0 || stopAt > startAt {
+		t.Fatalf("expected the db container stopped then restarted, in that order: %v", f.Calls)
+	}
+	entries, _ := os.ReadDir(opts.OutputDir)
+	if len(entries) != 0 {
+		t.Fatalf("output dir not clean (no .tar, .partial or temp files expected): %v", entries)
 	}
 }
