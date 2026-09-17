@@ -17,3 +17,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Go
+/dv-backup
+/dist/
+coverage.out
+*.test

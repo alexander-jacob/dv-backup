@@ -97,8 +97,8 @@ Dependencies: `github.com/moby/moby/client`, `github.com/spf13/cobra`, `github.c
 Volume data is read and written **only** through a short-lived helper container running GNU tar:
 
 ```
-backup:   docker run --rm -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --acls --sparse -C /data -cpf - .
-restore:  docker run --rm -i -v <vol>:/data <image> tar --numeric-owner --xattrs --acls -C /data -xpf -
+backup:   docker run --rm -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --xattrs-include=* --acls --sparse -C /data -cpf - .
+restore:  docker run --rm -i -v <vol>:/data <image> tar --numeric-owner --xattrs --xattrs-include=* --acls -C /data -xpf -
 clear:    docker run --rm -v <vol>:/data <image> find /data -mindepth 1 -delete
 empty?:   docker run --rm -v <vol>:/data:ro <image> find /data -mindepth 1 -maxdepth 1 -print -quit
 ```
@@ -248,7 +248,7 @@ Repository files: `README.md`, `LICENSE` (MIT), `go.mod`, `.golangci.yml`, `.gor
 ## 10. Open questions and known limitations
 
 1. **Image content copy-up timing — settled (2026-09-17, Docker 29.8.1):** when an image has files at a volume's mount path, Docker copies them into a new empty named volume at container **create** time, before any start (verified with `docker create` of `nginx:alpine` mounting a fresh volume at `/usr/share/nginx/html`: the volume held `index.html` and `50x.html` without the container ever starting). Consequently restore after `compose up --no-start` sees a non-empty volume for such images and requires `--force`. Documented in `--help` and README; the integration test covers it.
-2. **xattrs/ACLs:** requested from GNU tar but not covered by the spike; the integration test adds a `user.*` xattr and a `security.capability` xattr where the filesystem and kernel support it. Not verified: whether GNU tar's `--xattrs` on extraction restores `security.*` and `system.*` keys by default or only `user.*`; if not, add `--xattrs-include='*'` on restore and re-test.
+2. **xattrs/ACLs — settled (2026-09-17, integration test `TestXattrsRoundTrip`):** GNU tar 1.35 already archives every xattr key, including `security.*`, on creation with only `--xattrs`. The loss was on **extraction**: GNU tar's default xattr filter on `-x` only restores `user.*`, so `security.capability` was silently dropped when a `.tar` was unpacked back into a volume. Adding `--xattrs-include='*'` to both the backup and restore helper's `tar` invocation (`BackupHelper`, `RestoreHelper` in `internal/dockerx/dockerx.go`) fixes it — the flag is set on both sides for symmetry, though it is only load-bearing on restore. Verified: a `user.*` xattr and `security.capability` (VFS_CAP_REVISION_2) both round-trip correctly. `--acls` was already present and is unaffected. Not fixed by this flag: `trusted.*` (and possibly `security.selinux`) records present in an archive may still fail to apply on restore, because the helper container runs without `CAP_SYS_ADMIN`; GNU tar only warns (`Cannot set 'trusted.*' extended attribute for file ...: Operation not permitted`) and continues rather than failing the run.
 3. **Bind mounts and anonymous volumes** are not backed up (reported by `stat` only).
 4. **Consistency with `--no-stop`** is not guaranteed; flagged in manifest and `stat --archive`.
 5. **Helper image tag** `debian:13-slim` must be bumped when Debian 13 reaches end of life.
@@ -303,6 +303,7 @@ The helper is the only code that touches volume data. Get every detail right:
    - For restore: `Config.OpenStdin = true`, `Config.StdinOnce = true`, `Config.AttachStdin = true`.
    - `Config.Labels = {"dv-backup.helper": "true"}` and `Name = "dv-backup-helper-<random hex>"`, so stray helpers can be identified.
    - `HostConfig.NetworkMode = "none"`.
+   - `HostConfig.LogConfig = container.LogConfig{Type: "none"}`. **Mandatory:** without a TTY the daemon sends container stdout to the log driver as well as to attached streams, so with the default `json-file` driver (no size cap, JSON-escaped) every backup would also write its whole tar stream to `/var/lib/docker/containers/<id>/<id>-json.log` and could fill the host disk. Attach still delivers stdout and stderr with the `none` driver.
    - `HostConfig.Mounts = []mount.Mount{{Type: mount.TypeVolume, Source: vol, Target: "/data", ReadOnly: <true for backup/empty-check>, VolumeOptions: &mount.VolumeOptions{NoCopy: true}}}`. **`NoCopy: true` is mandatory:** without it, Docker copies image content at `/data` into an empty volume, which would corrupt a restore or make an empty volume look non-empty.
    - **Do not set `AutoRemove`.** The container could disappear before the exit code is read. Remove it explicitly in a `defer` with `Force: true`, using a non-cancelled context.
 2. **Attach** (`Stream: true`, `Stdout: true`, `Stderr: true`, plus `Stdin: true` for restore) **before** starting, so no output is lost.
@@ -312,7 +313,7 @@ The helper is the only code that touches volume data. Get every detail right:
    - Backup: `stdcopy.StdCopy(pipelineWriter, stderrBuf, attach.Reader)`.
    - Restore: copy the decompressed volume tar into `attach.Conn`, then call `attach.CloseWrite()` so tar sees EOF. Drain output with `StdCopy` concurrently.
    - `stderrBuf` keeps only the last 64 KiB, for error messages.
-6. **Read the exit code** from `wait.Result` (or `wait.Error`), then close the attach response.
+6. **Read the exit code** from `wait.Result` (or `wait.Error`), then close the attach response. If `wait.Result` arrives before `StdCopy` has returned, first wait for `StdCopy` to reach EOF (up to 30 s, or until the context is cancelled): the daemon can report the exit while up to about 1 MB of output is still buffered in its stream pipe or the socket, and closing the connection at once would fail a successful backup with "use of closed network connection".
 
 GNU tar exit codes: `0` success; `1` means files changed while being read (with `--create`), so the archive is not an exact copy; `2` fatal error. Rules:
 - containers stopped (normal backup): any non-zero exit → the volume fails → the backup fails
