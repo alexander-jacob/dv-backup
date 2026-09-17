@@ -16,6 +16,10 @@ import (
 	"github.com/moby/moby/client"
 )
 
+// outputGrace is how long RunHelper waits, after the helper container has
+// exited, for its buffered output to be read to EOF before giving up.
+const outputGrace = 30 * time.Second
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
@@ -55,6 +59,10 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	}
 	host := &container.HostConfig{
 		NetworkMode: "none",
+		// Without a TTY the daemon also copies stdout to the log driver; with
+		// the default json-file driver every backup would write the whole tar
+		// stream (JSON-escaped, uncapped) to the host's container log.
+		LogConfig: container.LogConfig{Type: "none"},
 		Mounts: []mount.Mount{{
 			Type:          mount.TypeVolume,
 			Source:        h.Volume,
@@ -161,6 +169,28 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 		return outErr
 	}
 
+	// drainOutput is used once the container has exited: the daemon can
+	// report the exit while output (up to about 1 MB) is still buffered in
+	// its stream pipe or the socket, so closing the connection right away
+	// would truncate a successful backup. It waits for the copy to reach EOF
+	// on its own, and only force-closes after outputGrace or when ctx is
+	// cancelled (in which case stopOnCancel has already closed attach).
+	drainOutput := func() error {
+		if outDrained {
+			return outErr
+		}
+		grace := time.NewTimer(outputGrace)
+		defer grace.Stop()
+		select {
+		case outErr = <-outDone:
+			outDrained = true
+			return outErr
+		case <-grace.C:
+		case <-ctx.Done():
+		}
+		return awaitOutput()
+	}
+
 	// Either the output stream ends (container exited, or ctx cancellation
 	// closed the connection) or the container's wait resolves first; either
 	// way we still need the other result before returning.
@@ -168,7 +198,7 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	case outErr = <-outDone:
 		outDrained = true
 	case res := <-wait.Result:
-		return d.finish(res, stderr, sendErr, awaitOutput())
+		return d.finish(res, stderr, sendErr, drainOutput())
 	case err := <-wait.Error:
 		_ = awaitOutput()
 		return HelperResult{}, fmt.Errorf("wait for helper container: %w", err)

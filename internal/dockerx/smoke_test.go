@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,109 @@ func TestHelperRoundTrip(t *testing.T) {
 	}
 
 	// No helper containers left behind.
+	assertNoStrayHelpers(t, d)
+}
+
+// TestHelperLogDriverNone proves that helper containers are created with the
+// "none" log driver, so the daemon does not also copy the (possibly
+// multi-GB) tar stream into the container's json-file log, and that attach
+// still delivers stdout and stderr with that driver.
+func TestHelperLogDriverNone(t *testing.T) {
+	d, err := Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+	name := "dv-backup-test-helper-log-" + randomHex(4)
+	if err := d.CreateVolume(ctx, Volume{Name: name, Driver: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.c.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true}) })
+
+	type result struct {
+		res HelperResult
+		err error
+	}
+	var out bytes.Buffer
+	done := make(chan result, 1)
+	go func() {
+		res, err := d.RunHelper(ctx, Helper{Image: DefaultImage, Volume: name, Entrypoint: "sh",
+			Args: []string{"-c", "echo to-stdout; echo to-stderr >&2; sleep 3"}, Stdout: &out})
+		done <- result{res, err}
+	}()
+
+	// Find the helper while it runs (it mounts our uniquely named test
+	// volume) and inspect its log configuration.
+	logType := ""
+	deadline := time.Now().Add(20 * time.Second)
+	for logType == "" && time.Now().Before(deadline) {
+		cs, err := d.ListContainers(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range cs {
+			if c.IsHelper() && c.UsesVolume(name) {
+				ins, err := d.c.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+				if err == nil && ins.Container.HostConfig != nil {
+					logType = ins.Container.HostConfig.LogConfig.Type
+				}
+			}
+		}
+		if logType == "" {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	r := <-done
+	if logType != "none" {
+		t.Fatalf("helper log driver = %q, want \"none\"", logType)
+	}
+	if r.err != nil || r.res.ExitCode != 0 || out.String() != "to-stdout\n" || !strings.Contains(r.res.Stderr, "to-stderr") {
+		t.Fatalf("attach output with log driver none: res=%+v err=%v stdout=%q", r.res, r.err, out.String())
+	}
+	assertNoStrayHelpers(t, d)
+}
+
+// countingSlowWriter counts bytes and sleeps per write, so the helper
+// container exits (and wait.Result fires) while output is still buffered in
+// the daemon and the attach connection.
+type countingSlowWriter struct {
+	n     int
+	delay time.Duration
+}
+
+func (w *countingSlowWriter) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	w.n += len(p)
+	return len(p), nil
+}
+
+// TestHelperDrainsOutputAfterExit proves RunHelper reads all buffered output
+// after the container has exited instead of closing the attach connection
+// as soon as wait.Result arrives.
+func TestHelperDrainsOutputAfterExit(t *testing.T) {
+	d, err := Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+	name := "dv-backup-test-helper-drain-" + randomHex(4)
+	if err := d.CreateVolume(ctx, Volume{Name: name, Driver: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = d.c.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true}) })
+
+	const size = 4 << 20
+	w := &countingSlowWriter{delay: 2 * time.Millisecond}
+	res, err := d.RunHelper(ctx, Helper{Image: DefaultImage, Volume: name, Entrypoint: "head",
+		Args: []string{"-c", strconv.Itoa(size), "/dev/urandom"}, Stdout: w})
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("res=%+v err=%v (read %d of %d bytes)", res, err, w.n, size)
+	}
+	if w.n != size {
+		t.Fatalf("read %d bytes, want %d", w.n, size)
+	}
 	assertNoStrayHelpers(t, d)
 }
 

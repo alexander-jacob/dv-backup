@@ -303,6 +303,7 @@ The helper is the only code that touches volume data. Get every detail right:
    - For restore: `Config.OpenStdin = true`, `Config.StdinOnce = true`, `Config.AttachStdin = true`.
    - `Config.Labels = {"dv-backup.helper": "true"}` and `Name = "dv-backup-helper-<random hex>"`, so stray helpers can be identified.
    - `HostConfig.NetworkMode = "none"`.
+   - `HostConfig.LogConfig = container.LogConfig{Type: "none"}`. **Mandatory:** without a TTY the daemon sends container stdout to the log driver as well as to attached streams, so with the default `json-file` driver (no size cap, JSON-escaped) every backup would also write its whole tar stream to `/var/lib/docker/containers/<id>/<id>-json.log` and could fill the host disk. Attach still delivers stdout and stderr with the `none` driver.
    - `HostConfig.Mounts = []mount.Mount{{Type: mount.TypeVolume, Source: vol, Target: "/data", ReadOnly: <true for backup/empty-check>, VolumeOptions: &mount.VolumeOptions{NoCopy: true}}}`. **`NoCopy: true` is mandatory:** without it, Docker copies image content at `/data` into an empty volume, which would corrupt a restore or make an empty volume look non-empty.
    - **Do not set `AutoRemove`.** The container could disappear before the exit code is read. Remove it explicitly in a `defer` with `Force: true`, using a non-cancelled context.
 2. **Attach** (`Stream: true`, `Stdout: true`, `Stderr: true`, plus `Stdin: true` for restore) **before** starting, so no output is lost.
@@ -312,7 +313,7 @@ The helper is the only code that touches volume data. Get every detail right:
    - Backup: `stdcopy.StdCopy(pipelineWriter, stderrBuf, attach.Reader)`.
    - Restore: copy the decompressed volume tar into `attach.Conn`, then call `attach.CloseWrite()` so tar sees EOF. Drain output with `StdCopy` concurrently.
    - `stderrBuf` keeps only the last 64 KiB, for error messages.
-6. **Read the exit code** from `wait.Result` (or `wait.Error`), then close the attach response.
+6. **Read the exit code** from `wait.Result` (or `wait.Error`), then close the attach response. If `wait.Result` arrives before `StdCopy` has returned, first wait for `StdCopy` to reach EOF (up to 30 s, or until the context is cancelled): the daemon can report the exit while up to about 1 MB of output is still buffered in its stream pipe or the socket, and closing the connection at once would fail a successful backup with "use of closed network connection".
 
 GNU tar exit codes: `0` success; `1` means files changed while being read (with `--create`), so the archive is not an exact copy; `2` fatal error. Rules:
 - containers stopped (normal backup): any non-zero exit → the volume fails → the backup fails
