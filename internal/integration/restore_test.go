@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
@@ -104,7 +105,12 @@ func TestRestoreAfterCreateNoStartNeedsForce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _, _ = h.raw.ContainerRemove(h.ctx, c.ID, client.ContainerRemoveOptions{Force: true}) })
+	// Use context.Background(), not h.ctx: h.ctx has a 5-minute timeout, and
+	// cleanup must still run when that timeout is exactly why the test
+	// failed. A silently-failed ContainerRemove here would keep the volume
+	// in use, so VolumeRemove in t.Cleanup would fail too, leaking
+	// dv-backup-test-* resources.
+	t.Cleanup(func() { _, _ = h.raw.ContainerRemove(context.Background(), c.ID, client.ContainerRemoveOptions{Force: true}) })
 
 	if _, _, err := h.restore(res.Path, false, vol); !errors.Is(err, restore.ErrBlocked) {
 		t.Fatalf("expected blocked (copy-up made the volume non-empty), got %v", err)

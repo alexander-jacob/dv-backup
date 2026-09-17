@@ -97,8 +97,8 @@ Dependencies: `github.com/moby/moby/client`, `github.com/spf13/cobra`, `github.c
 Volume data is read and written **only** through a short-lived helper container running GNU tar:
 
 ```
-backup:   docker run --rm -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --acls --sparse -C /data -cpf - .
-restore:  docker run --rm -i -v <vol>:/data <image> tar --numeric-owner --xattrs --acls -C /data -xpf -
+backup:   docker run --rm -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --xattrs-include=* --acls --sparse -C /data -cpf - .
+restore:  docker run --rm -i -v <vol>:/data <image> tar --numeric-owner --xattrs --xattrs-include=* --acls -C /data -xpf -
 clear:    docker run --rm -v <vol>:/data <image> find /data -mindepth 1 -delete
 empty?:   docker run --rm -v <vol>:/data:ro <image> find /data -mindepth 1 -maxdepth 1 -print -quit
 ```
@@ -248,7 +248,7 @@ Repository files: `README.md`, `LICENSE` (MIT), `go.mod`, `.golangci.yml`, `.gor
 ## 10. Open questions and known limitations
 
 1. **Image content copy-up timing — settled (2026-09-17, Docker 29.8.1):** when an image has files at a volume's mount path, Docker copies them into a new empty named volume at container **create** time, before any start (verified with `docker create` of `nginx:alpine` mounting a fresh volume at `/usr/share/nginx/html`: the volume held `index.html` and `50x.html` without the container ever starting). Consequently restore after `compose up --no-start` sees a non-empty volume for such images and requires `--force`. Documented in `--help` and README; the integration test covers it.
-2. **xattrs/ACLs — settled (2026-09-17, integration test `TestXattrsRoundTrip`):** with only `--xattrs`, GNU tar's default xattr filter restores a `user.*` key but silently drops `security.capability` on both backup and restore. Adding `--xattrs-include='*'` to both the backup and restore helper's `tar` invocation (`BackupHelper`, `RestoreHelper` in `internal/dockerx/dockerx.go`) fixes it: both a `user.*` xattr and `security.capability` (VFS_CAP_REVISION_2) round-trip correctly. `--acls` was already present and is unaffected.
+2. **xattrs/ACLs — settled (2026-09-17, integration test `TestXattrsRoundTrip`):** GNU tar 1.35 already archives every xattr key, including `security.*`, on creation with only `--xattrs`. The loss was on **extraction**: GNU tar's default xattr filter on `-x` only restores `user.*`, so `security.capability` was silently dropped when a `.tar` was unpacked back into a volume. Adding `--xattrs-include='*'` to both the backup and restore helper's `tar` invocation (`BackupHelper`, `RestoreHelper` in `internal/dockerx/dockerx.go`) fixes it — the flag is set on both sides for symmetry, though it is only load-bearing on restore. Verified: a `user.*` xattr and `security.capability` (VFS_CAP_REVISION_2) both round-trip correctly. `--acls` was already present and is unaffected. Not fixed by this flag: `trusted.*` (and possibly `security.selinux`) records present in an archive may still fail to apply on restore, because the helper container runs without `CAP_SYS_ADMIN`; GNU tar only warns (`Cannot set 'trusted.*' extended attribute for file ...: Operation not permitted`) and continues rather than failing the run.
 3. **Bind mounts and anonymous volumes** are not backed up (reported by `stat` only).
 4. **Consistency with `--no-stop`** is not guaranteed; flagged in manifest and `stat --archive`.
 5. **Helper image tag** `debian:13-slim` must be bumped when Debian 13 reaches end of life.
