@@ -76,10 +76,10 @@ Specifically, when an image has files at a volume's mount path, Docker copies th
 Volume data is read and written only through a short-lived helper container running GNU tar, using the Docker API directly (create, attach stdout/stdin, start, wait for exit code, remove) rather than shelling out to the `docker` CLI:
 
 ```
-backup:   docker run --rm -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --xattrs-include=* --acls --sparse -C /data -cpf - .
-restore:  docker run --rm -i -v <vol>:/data <image> tar --numeric-owner --xattrs --xattrs-include=* --acls -C /data -xpf -
-clear:    docker run --rm -v <vol>:/data <image> find /data -mindepth 1 -delete
-empty?:   docker run --rm -v <vol>:/data:ro <image> find /data -mindepth 1 -maxdepth 1 -print -quit
+backup:   docker run --rm --log-driver none -v <vol>:/data:ro <image> tar --numeric-owner --xattrs --xattrs-include=* --acls --sparse -C /data -cpf - .
+restore:  docker run --rm --log-driver none -i -v <vol>:/data <image> tar --numeric-owner --xattrs --xattrs-include=* --acls -C /data -xpf -
+clear:    docker run --rm --log-driver none -v <vol>:/data <image> find /data -mindepth 1 -delete
+empty?:   docker run --rm --log-driver none -v <vol>:/data:ro <image> find /data -mindepth 1 -maxdepth 1 -print -quit
 ```
 
 `--xattrs-include=*` is set on both sides for symmetry: GNU tar already archives every xattr key (including `security.*`) with just `--xattrs`, but its default extraction filter only restores `user.*`, silently dropping keys such as `security.capability` unless `--xattrs-include=*` is also given on extract.
@@ -130,7 +130,9 @@ volumes:
 - Restart does not wait for health checks: an application container started before its database is ready may exit and only recover through its own restart policy.
 - A `SIGKILL` of `dv-backup` leaves containers stopped and possibly a helper container behind; clean up with `docker start` of the containers listed in the output, and `docker rm -f $(docker ps -aq --filter label=dv-backup.helper)`.
 - Image pulls are anonymous; the Docker API does not read `~/.docker/config.json`, so for a private registry the operator must `docker pull` the image first.
-- Bind mounts, anonymous volumes, and Compose `external: true` volumes are not backed up; `stat` only reports the first two, and `external: true` volumes carry no Compose labels so `--project` never selects them — they must be named explicitly or included via an unfiltered backup.
+- Bind mounts and anonymous volumes are not backed up; `stat` only reports them.
+- Compose `external: true` volumes are backed up like any other named volume, but they carry no Compose labels, so `--project` never selects them: name them explicitly or use an unfiltered backup.
+- Disk space: during a backup the output directory needs roughly the final archive size plus the largest compressed volume, because each volume is compressed to a temporary file before it is appended to the archive. `backup` warns when the selected volumes' disk usage exceeds the free space.
 - `--no-stop` does not guarantee consistency; affected volumes are marked `consistent: false` in the manifest and flagged by `stat --archive`.
 - Rootless Docker and Windows containers are not supported or tested.
 - The default helper image `debian:13-slim` must be bumped when Debian 13 reaches end of life.
@@ -148,7 +150,7 @@ volumes:
 
 ```bash
 go test ./...
-go test -tags integration ./internal/integration/
+go test -tags integration ./internal/dockerx/ ./internal/integration/
 ```
 
 Integration tests create and touch only resources named `dv-backup-test-*`. **Never run an unfiltered `backup` or a forced `restore` on a workstation**: this project is developed on a machine with hundreds of unrelated volumes and containers, and both commands act on real Docker state.

@@ -1,7 +1,6 @@
 name: ci
 on:
   push:
-    branches: [main]
   pull_request:
 jobs:
   test:
@@ -17,4 +16,4 @@ jobs:
           version: latest
       - run: go test ./...
       - run: docker info --format '{{.ServerVersion}}'
-      - run: go test -tags integration ./internal/integration/ -v -count=1
+      - run: go test -tags integration ./internal/dockerx/ ./internal/integration/ -v -count=1 -timeout 20m
