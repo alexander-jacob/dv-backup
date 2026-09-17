@@ -1,7 +1,7 @@
 # dv-backup — Design
 
 - **Date:** 2026-09-17
-- **Status:** Approved in brainstorming, pending spec review
+- **Status:** Approved (2026-09-17). Implementation plan not yet written.
 - **Repository:** https://github.com/alexander-jacob/dv-backup (public, MIT)
 - **Module path:** `github.com/alexander-jacob/dv-backup`
 
@@ -173,7 +173,7 @@ Principle: check everything first, then change things; never leave a state that 
 3. **Stop** (unless `--no-stop`): collect all *running* containers using any selected volume; stop each once, with its own configured stop timeout; remember the list.
 4. **Archive:** write to `<name>.tar.partial`; for each volume stream helper-tar → zstd → sha256 → temp file → outer tar. After all volumes, write `manifest.yaml` and `README.md`, close, rename to `<name>.tar`.
 5. **Any volume failure fails the whole backup**: remove `.partial` and temp files, exit non-zero.
-6. **Always restart** exactly the containers stopped in step 3 — on success, error, `SIGINT` or `SIGTERM` — using a context that is not the cancelled one. Remove helper containers. Restart failures are reported per container and produce exit code 3.
+6. **Always restart** exactly the containers stopped in step 3 — on success, error, `SIGINT` or `SIGTERM` — using a context that is not the cancelled one, in ascending order of their original `State.StartedAt` (so dependencies started earlier come back first). Remove helper containers. Restart failures are reported per container and produce exit code 3.
 
 A `SIGKILL` of `dv-backup` cannot be handled; containers may remain stopped. This is documented.
 
@@ -236,3 +236,149 @@ Repository files: `README.md`, `LICENSE` (MIT), `go.mod`, `.golangci.yml`, `.gor
 3. **Bind mounts and anonymous volumes** are not backed up (reported by `stat` only).
 4. **Consistency with `--no-stop`** is not guaranteed; flagged in manifest and `stat --archive`.
 5. **Helper image tag** `debian:13-slim` must be bumped when Debian 13 reaches end of life.
+
+## 11. Implementation notes (verified facts for a fresh implementer)
+
+Everything in this section was checked on 2026-09-17 with `go doc` against the listed module versions or observed in the spike. Re-verify with `go doc` if you upgrade modules.
+
+### 11.1 Docker Go client
+
+- Use **`github.com/moby/moby/client`** (verified `v0.6.0`) with types from **`github.com/moby/moby/api`** (verified `v1.56.0`). Do **not** use the older `github.com/docker/docker/client`; examples found online mostly use that one and its method signatures differ.
+- This client uses an *options struct in, result struct out* style for almost every call. Verified signatures:
+
+  ```go
+  client.New(client.FromEnv)                                                          // honours DOCKER_HOST etc.
+  (*Client).Close() error
+  (*Client).Info(ctx, client.InfoOptions{}) (client.SystemInfoResult, error)          // .Info.Name = daemon hostname
+  (*Client).ServerVersion(ctx, client.ServerVersionOptions{}) (client.ServerVersionResult, error) // .Version
+  (*Client).VolumeList(ctx, client.VolumeListOptions{Filters: f}) (client.VolumeListResult, error) // .Items []volume.Volume
+  (*Client).VolumeInspect(ctx, name, client.VolumeInspectOptions{}) (client.VolumeInspectResult, error) // .Volume
+  (*Client).VolumeCreate(ctx, client.VolumeCreateOptions{Name, Driver, DriverOpts, Labels}) (client.VolumeCreateResult, error)
+  (*Client).DiskUsage(ctx, client.DiskUsageOptions{Volumes: true}) (client.DiskUsageResult, error) // .Volumes.Items[].UsageData
+  (*Client).ContainerList(ctx, client.ContainerListOptions{All: true, Filters: f}) (client.ContainerListResult, error) // .Items []container.Summary
+  (*Client).ContainerInspect(ctx, id, client.ContainerInspectOptions{}) (client.ContainerInspectResult, error) // .Container.State.StartedAt
+  (*Client).ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: nil})        // nil = container's own StopTimeout
+  (*Client).ContainerStart(ctx, id, client.ContainerStartOptions{})
+  (*Client).ContainerCreate(ctx, client.ContainerCreateOptions{Config, HostConfig, Name}) (client.ContainerCreateResult, error) // .ID
+  (*Client).ContainerAttach(ctx, id, client.ContainerAttachOptions{Stream, Stdin, Stdout, Stderr}) (client.ContainerAttachResult, error)
+  (*Client).ContainerWait(ctx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNextExit}) client.ContainerWaitResult // .Result <-chan container.WaitResponse, .Error <-chan error
+  (*Client).ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true})
+  (*Client).ImageInspect(ctx, ref) (client.ImageInspectResult, error)                // embeds image.InspectResponse (.RepoDigests)
+  (*Client).ImagePull(ctx, ref, client.ImagePullOptions{}) (client.ImagePullResponse, error) // call .Wait(ctx)
+  ```
+
+- `client.Filters` is `map[string]map[string]bool`; build with `make(client.Filters).Add("volume", name)`.
+- `container.Summary.Mounts []container.MountPoint` has `Type`, `Name` (volume name), `Source`, `Destination`, `RW` — enough to find volume users and writable bind mounts without inspecting each container.
+- `ContainerList` filter `volume=<name>` returns containers mounting that volume. Use `All: true`, then check `State == container.StateRunning` (`"running"`).
+- Demultiplex attached output with `stdcopy.StdCopy(stdout, stderr, reader)` from **`github.com/moby/moby/api/pkg/stdcopy`** (not `client/pkg/stdcopy`, which does not exist).
+
+### 11.2 Helper container recipe
+
+The helper is the only code that touches volume data. Get every detail right:
+
+1. **Create** with:
+   - `Config.Image` = helper image, `Config.Entrypoint` = `[]string{"tar"}` (or `find`), `Config.Cmd` = the arguments. Always set `Entrypoint` explicitly so an overridden `--image` with its own entrypoint cannot change the behaviour.
+   - `Config.User = "0:0"`: tar must run as root to restore ownership.
+   - `Config.Tty = false`: stdout and stderr are multiplexed, and the stream is binary-safe.
+   - For restore: `Config.OpenStdin = true`, `Config.StdinOnce = true`, `Config.AttachStdin = true`.
+   - `Config.Labels = {"dv-backup.helper": "true"}` and `Name = "dv-backup-helper-<random hex>"`, so stray helpers can be identified.
+   - `HostConfig.NetworkMode = "none"`.
+   - `HostConfig.Mounts = []mount.Mount{{Type: mount.TypeVolume, Source: vol, Target: "/data", ReadOnly: <true for backup/empty-check>, VolumeOptions: &mount.VolumeOptions{NoCopy: true}}}`. **`NoCopy: true` is mandatory:** without it, Docker copies image content at `/data` into an empty volume, which would corrupt a restore or make an empty volume look non-empty.
+   - **Do not set `AutoRemove`.** The container could disappear before the exit code is read. Remove it explicitly in a `defer` with `Force: true`, using a non-cancelled context.
+2. **Attach** (`Stream: true`, `Stdout: true`, `Stderr: true`, plus `Stdin: true` for restore) **before** starting, so no output is lost.
+3. **Wait** with `WaitConditionNextExit` **before** starting (the documented way to avoid missing a fast exit).
+4. **Start.**
+5. **Stream:**
+   - Backup: `stdcopy.StdCopy(pipelineWriter, stderrBuf, attach.Reader)`.
+   - Restore: copy the decompressed volume tar into `attach.Conn`, then call `attach.CloseWrite()` so tar sees EOF. Drain output with `StdCopy` concurrently.
+   - `stderrBuf` keeps only the last 64 KiB, for error messages.
+6. **Read the exit code** from `wait.Result` (or `wait.Error`), then close the attach response.
+
+GNU tar exit codes: `0` success; `1` means files changed while being read (with `--create`), so the archive is not an exact copy; `2` fatal error. Rules:
+- containers stopped (normal backup): any non-zero exit → the volume fails → the backup fails
+- `--no-stop`: exit `1` → warning, volume marked `consistent: false`; exit `2` → the backup fails
+- restore, clear, empty check: any non-zero exit is an error
+
+### 11.3 Volume classification
+
+- **Anonymous volume:** has the label `com.docker.volume.anonymous` (verified on Docker 29.8.1: present on exactly the 77 hex-named volumes of the workstation), **or** its name matches `^[0-9a-f]{64}$` (older daemons). Anonymous volumes are excluded from backup and listed as warnings by `stat`.
+- **Compose project of a volume:** label `com.docker.compose.project`. Compose also sets `com.docker.compose.volume` and `com.docker.compose.version`. Restore copies **all** labels verbatim. Compose recognises an existing volume through these labels; without them it warns that the volume "already exists but was not created by Docker Compose".
+- **Writable bind mounts** (for the `stat` warning): `MountPoint.Type == "bind" && RW`. Skip `Source` values under `/var/run`, `/run`, `/dev`, `/proc` and `/sys`.
+
+### 11.4 Other decisions fixed for implementation
+
+- **Host name** in manifest and file name: the Docker daemon's `Info.Name`, not `os.Hostname()`. It must describe the Docker host even with a remote `DOCKER_HOST`.
+- **Archive file permissions:** `0600`. Volume data often contains secrets (database contents, credentials). The README must state that archives are **not encrypted**.
+- **Temporary files:** `<output-dir>/.dv-backup-<volume>-<random>.tmp`, removed on success and failure.
+- **Filename sanitising:** Docker host names are safe for file names; still, replace any character outside `[A-Za-z0-9._-]` with `-`.
+- **Helper image digest in manifest:** first `RepoDigests` entry from `ImageInspect`; if empty (locally built image), record the image ID.
+- **Volume size in `stat`:** `DiskUsage` with `Volumes: true`; `Volume.UsageData` is a pointer that may be `nil`, and `UsageData.Size` is `-1` when unknown; show `?` in both cases.
+- **Rootless Docker:** not supported or tested. `--numeric-owner` inside a user namespace maps IDs differently. Document as a limitation.
+
+### 11.5 Safety when developing on a workstation
+
+The author's workstation has ~645 volumes and ~187 containers from unrelated projects, including running databases.
+- Integration tests must create and select **only** resources prefixed `dv-backup-test-` and must always pass explicit volume names to `backup`/`restore`. **Never** run an unfiltered `backup` or `restore --force` from a test.
+- Tests must never call `docker volume prune`, `docker system prune`, or remove anything they did not create.
+
+## 12. Decision log
+
+These were debated and settled with the maintainer. Do not reopen them without new evidence.
+
+| Decision | Rejected alternatives | Reason |
+|---|---|---|
+| Volumes only | containers (`export`/`commit`), images, bind mounts | Pipeline recreates everything but volume data; `export`/`commit` exclude volume contents and lose config; bind mount host paths change on new VMs (runner checkout paths). |
+| Go | Bash script | Stop/restart and restore state logic must be reliable (`defer`, real errors, unit tests); single binary with no host dependencies besides Docker. |
+| GNU tar in helper container | Docker copy API; reading `/var/lib/docker/volumes` directly | Spike: only GNU tar was fully faithful; direct access needs root, only works with the `local` driver and depends on Docker internals. |
+| Stop containers by default, `--no-stop` opt-out | always live; opt-in stop | File-level copies of running databases can be unusable (PostgreSQL docs: file system level backup requires the server to be shut down). |
+| One failing volume fails the whole backup | skip and mark | An incomplete archive is only discovered at restore time. |
+| All named volumes by default | only in-use volumes; explicit list | VMs only contain pipeline-created volumes; explicit lists go stale. |
+| Restore supports before- and after-deploy flows | one flow only | Maintainer requirement. |
+| Per-volume `.tar.zst` inside an uncompressed outer tar | one big compressed tar; directory of files | One file to `scp`; the manifest is readable without decompressing; per-volume checksums and selective restore. |
+| YAML manifest + generated README.md | JSON | Human readability was the original requirement; YAML was only rejected earlier for Bash. |
+| Local file in/out, transport by operator | Azure Blob, Azure Files, GitLab | Maintainer copies archives with `scp`. |
+| Public on GitHub, MIT | internal GitLab; Apache-2.0; GPL-3.0 | Open source; MIT is shortest for a small CLI. |
+| Name `dv-backup` ("docker volume backup") | `dc-backup` | Renamed by maintainer. |
+
+## Appendix A: Spike fixture scripts
+
+Reuse these in the integration tests (port to Go or run through the helper image). **Populate** runs as root with the volume mounted at `/data`:
+
+```bash
+set -e
+cd /data
+mkdir -p pgdata empty setgid sticky
+echo 17 > pgdata/PG_VERSION
+chmod 0600 pgdata/PG_VERSION
+chown -R 999:999 pgdata && chmod 0700 pgdata
+chown 1000:1000 empty && chmod 0750 empty
+ln -s pgdata/PG_VERSION rel-link && chown -h 999:999 rel-link
+ln -s /etc/passwd abs-link
+echo hard > hard1 && ln hard1 hard2
+chmod 2775 setgid && chown 0:999 setgid
+chmod 1777 sticky
+printf '#!/bin/sh\necho hi\n' > exec.sh && chmod 0755 exec.sh
+echo x > "file with spaces & ümlaut"
+mkfifo fifo
+truncate -s 100M sparse.img
+head -c 200M /dev/urandom > big.bin
+touch -h -d '2020-01-02 03:04:05' pgdata/PG_VERSION exec.sh hard1 rel-link big.bin
+chown 999:999 /data && chmod 0700 /data
+```
+
+**Inspect** produces a comparable listing. Two volumes are identical when their outputs are identical:
+
+```bash
+cd /data && find . -printf '%U:%G %#m %y %n %Ts %l %p\n' | sort -k7
+echo "--- sums"; find . -type f -exec md5sum {} + | sort -k2
+echo "--- disk usage (sparse check)"; du -sk sparse.img big.bin 2>/dev/null
+```
+
+For tests, use a smaller `big.bin` (e.g. 5 MB) so they stay fast. The sparse file can stay at 100 MB, since it takes no disk space.
+
+## Appendix B: Development environment (as of 2026-09-17)
+
+- Go `1.27.1` installed at `~/sdk/go1.27.1` (on `PATH`); Docker Engine `29.8.1`; IDE GoLand.
+- Repository `github.com/alexander-jacob/dv-backup` exists and is empty; the local repo has the remote `origin` but **has not been pushed**. Existing commits use the author's work email. Ask the maintainer before the first push whether to rewrite them to a GitHub `noreply` address.
+- `.gitignore` currently covers archives (`*.tar`, `*.tar.zst`), `.env*`, `.idea/`, `.vscode/`, OS files and logs. Add Go entries (`/dv-backup` binary, `/dist/`, `coverage.out`, `*.test`) during scaffolding.
+- Spike code lived in a session scratchpad and is gone; Appendix A preserves what matters.
