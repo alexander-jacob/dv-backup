@@ -94,6 +94,7 @@ func Run(ctx context.Context, d dockerx.Docker, out, errOut io.Writer, opts Opti
 	}()
 	if err = st.Stop(ctx, plan.ToStop()); err != nil {
 		res.Untouched = names(plan.Steps)
+		printOutcome(out, opts.Archive, res)
 		return res, err
 	}
 
@@ -102,14 +103,23 @@ func Run(ctx context.Context, d dockerx.Docker, out, errOut io.Writer, opts Opti
 		if err = apply(ctx, d, r, opts.Image, s); err != nil {
 			res.Failed = []string{s.Volume.Name}
 			res.Untouched = names(plan.Steps[i+1:])
-			fmt.Fprintf(out, "\nrestored:  %s\nfailed:    %s\nuntouched: %s\n", orNone(res.Restored), orNone(res.Failed), orNone(res.Untouched))
-			fmt.Fprintf(out, "retry with:\n  dv-backup restore --force %s %s\n", opts.Archive, strings.Join(append(res.Failed, res.Untouched...), " "))
+			printOutcome(out, opts.Archive, res)
 			return res, err
 		}
 		res.Restored = append(res.Restored, s.Volume.Name)
 		fmt.Fprintf(out, "restored %s\n", s.Volume.Name)
 	}
 	return res, nil
+}
+
+// printOutcome prints the per-volume restored/failed/untouched summary and
+// the exact command to retry the failed and untouched volumes with --force.
+// Called whenever a restore stops early, whether the failure was stopping a
+// container or applying a volume.
+func printOutcome(out io.Writer, archivePath string, res Result) {
+	fmt.Fprintf(out, "\nrestored:  %s\nfailed:    %s\nuntouched: %s\n", orNone(res.Restored), orNone(res.Failed), orNone(res.Untouched))
+	retry := append(append([]string{}, res.Failed...), res.Untouched...)
+	fmt.Fprintf(out, "retry with:\n  dv-backup restore --force %s %s\n", archivePath, strings.Join(retry, " "))
 }
 
 // observe gathers the host state of one volume.
@@ -181,9 +191,9 @@ func apply(ctx context.Context, d dockerx.Docker, r *archive.Reader, image strin
 func PrintPlan(out io.Writer, p Plan) {
 	fmt.Fprintln(out, "\nplan:")
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "  VOLUME\tACTION\tREASON")
+	fmt.Fprintln(tw, "  VOLUME\tSTATE\tACTION\tREASON")
 	for _, s := range p.Steps {
-		fmt.Fprintf(tw, "  %s\t%s\t%s\n", s.Volume.Name, s.Action, s.Reason)
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\n", s.Volume.Name, s.State, s.Action, s.Reason)
 	}
 	tw.Flush()
 	fmt.Fprintln(out)

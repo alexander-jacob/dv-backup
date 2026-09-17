@@ -124,6 +124,36 @@ func TestRestoreForceOverwrites(t *testing.T) {
 	}
 }
 
+func TestRestoreStopFailure(t *testing.T) {
+	path := writeArchive(t, t.TempDir(), map[string]string{"app_db": "DB", "app_files": "FILES"})
+	f := dockerx.NewFake()
+	f.AddVolume(dockerx.Volume{Name: "app_db", Driver: "local"}, []byte("OLD"))
+	f.AddVolume(dockerx.Volume{Name: "app_files", Driver: "local"}, []byte("OLDFILES"))
+	f.AddContainer(dockerx.Container{ID: "c1", Name: "app-db-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_db"}}})
+	f.AddContainer(dockerx.Container{ID: "c2", Name: "app-files-1", State: dockerx.StateRunning, Mounts: []dockerx.Mount{{Type: "volume", Name: "app_files"}}})
+	f.FailStop["c2"] = errors.New("stop failed")
+	res, out, _, err := run(t, f, Options{Archive: path, Image: dockerx.DefaultImage, Force: true})
+	if err == nil || !strings.Contains(err.Error(), "stop failed") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Join(res.Untouched, ",") != "app_db,app_files" || len(res.Restored)+len(res.Failed) != 0 {
+		t.Fatalf("res %+v", res)
+	}
+	if string(f.Data["app_db"]) != "OLD" || string(f.Data["app_files"]) != "OLDFILES" {
+		t.Fatal("stop failure must not touch volume data")
+	}
+	if !strings.Contains(out, "untouched: app_db, app_files") || !strings.Contains(out, "retry with:") ||
+		!strings.Contains(out, "dv-backup restore --force "+path+" app_db app_files") {
+		t.Fatalf("summary/retry missing:\n%s", out)
+	}
+	cs, _ := f.ListContainers(context.Background())
+	for _, c := range cs {
+		if c.State != dockerx.StateRunning {
+			t.Fatalf("container %s not restarted: %s", c.ID, c.State)
+		}
+	}
+}
+
 func TestRestoreSelectionAndUnknownName(t *testing.T) {
 	path := writeArchive(t, t.TempDir(), map[string]string{"app_db": "DB", "app_files": "FILES"})
 	f := dockerx.NewFake()

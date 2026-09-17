@@ -24,22 +24,26 @@ func TestBuildPlanTable(t *testing.T) {
 		want       Action
 		stops      int
 		reasonPart string
+		wantState  string
 	}{
-		{"missing", State{}, false, ActionCreate, 0, "does not exist"},
-		{"missing force", State{}, true, ActionCreate, 0, "does not exist"},
-		{"empty idle", State{Exists: true, Empty: true}, false, ActionUnpack, 0, "empty"},
-		{"empty idle force", State{Exists: true, Empty: true}, true, ActionUnpack, 0, "empty"},
-		{"has data", State{Exists: true}, false, ActionBlocked, 0, "contains data"},
-		{"has data force", State{Exists: true}, true, ActionOverwrite, 0, "contains data"},
-		{"empty in use", State{Exists: true, Empty: true, Users: []dockerx.Container{running("a")}}, false, ActionBlocked, 0, "in use by c-a (running)"},
-		{"empty in use force", State{Exists: true, Empty: true, Users: []dockerx.Container{running("a")}}, true, ActionOverwrite, 1, "in use"},
-		{"data in use force", State{Exists: true, Users: []dockerx.Container{running("a"), {ID: "b", Name: "c-b", State: dockerx.StatePaused}, {ID: "x", Name: "c-x", State: dockerx.StateExited}}}, true, ActionOverwrite, 2, "c-b (paused)"},
+		{"missing", State{}, false, ActionCreate, 0, "does not exist", "missing"},
+		{"missing force", State{}, true, ActionCreate, 0, "does not exist", "missing"},
+		{"empty idle", State{Exists: true, Empty: true}, false, ActionUnpack, 0, "empty", "empty"},
+		{"empty idle force", State{Exists: true, Empty: true}, true, ActionUnpack, 0, "empty", "empty"},
+		{"has data", State{Exists: true}, false, ActionBlocked, 0, "contains data", "has data"},
+		{"has data force", State{Exists: true}, true, ActionOverwrite, 0, "contains data", "has data"},
+		{"empty in use", State{Exists: true, Empty: true, Users: []dockerx.Container{running("a")}}, false, ActionBlocked, 0, "in use by c-a (running)", "empty, in use"},
+		{"empty in use force", State{Exists: true, Empty: true, Users: []dockerx.Container{running("a")}}, true, ActionOverwrite, 1, "in use", "empty, in use"},
+		{"data in use force", State{Exists: true, Users: []dockerx.Container{running("a"), {ID: "b", Name: "c-b", State: dockerx.StatePaused}, {ID: "x", Name: "c-x", State: dockerx.StateExited}}}, true, ActionOverwrite, 2, "c-b (paused)", "has data, in use"},
 	}
 	for _, tc := range cases {
 		p := BuildPlan([]manifest.Volume{mv("v")}, map[string]State{"v": tc.state}, tc.force)
 		s := p.Steps[0]
 		if s.Action != tc.want || len(s.Stop) != tc.stops || !strings.Contains(s.Reason, tc.reasonPart) {
 			t.Errorf("%s: got %s stops=%d reason=%q", tc.name, s.Action, len(s.Stop), s.Reason)
+		}
+		if s.State != tc.wantState {
+			t.Errorf("%s: State = %q, want %q", tc.name, s.State, tc.wantState)
 		}
 		if s.Action == ActionBlocked && !strings.Contains(s.Reason, "--force") {
 			t.Errorf("%s: blocked reason must mention --force", tc.name)

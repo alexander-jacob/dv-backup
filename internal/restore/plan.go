@@ -36,6 +36,7 @@ type State struct {
 // Step is the planned action for one volume.
 type Step struct {
 	Volume   manifest.Volume
+	State    string // current host state: "missing", "empty" or "has data", plus ", in use"
 	Action   Action
 	Reason   string
 	Stop     []dockerx.Container
@@ -86,6 +87,17 @@ func BuildPlan(vols []manifest.Volume, states map[string]State, force bool) Plan
 				inUse = append(inUse, c)
 				users = append(users, fmt.Sprintf("%s (%s)", c.Name, c.State))
 			}
+		}
+		switch {
+		case !st.Exists:
+			step.State = "missing"
+		case st.Empty:
+			step.State = "empty"
+		default:
+			step.State = "has data"
+		}
+		if len(inUse) > 0 {
+			step.State += ", in use"
 		}
 		switch {
 		case !st.Exists:
