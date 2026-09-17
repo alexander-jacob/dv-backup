@@ -175,3 +175,116 @@ func TestWriterAddVolumeErrorCleansTemp(t *testing.T) {
 		t.Fatalf("directory not clean: %v", files)
 	}
 }
+
+func writeTestArchive(t *testing.T, dir string, volumes map[string][]byte) (string, *manifest.Manifest) {
+	t.Helper()
+	w, err := NewWriter(dir, "h", testTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newManifest()
+	for name, data := range volumes {
+		entry, n, err := w.AddVolume(name, bytes.NewReader(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.Volumes = append(m.Volumes, manifest.Volume{Name: name, Driver: "local", SizeBytes: n, Archive: entry, Consistent: true})
+	}
+	if err := w.Finish(m); err != nil {
+		t.Fatal(err)
+	}
+	return w.Path(), m
+}
+
+func TestReaderRoundTrip(t *testing.T) {
+	a, b := fakeTarStream(1, 50_000), fakeTarStream(9, 10)
+	path, _ := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": a, "vol_b": b})
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if len(r.Manifest().Volumes) != 2 {
+		t.Fatalf("manifest volumes = %d", len(r.Manifest().Volumes))
+	}
+	for name, want := range map[string][]byte{"vol_a": a, "vol_b": b} {
+		if err := r.Verify(name); err != nil {
+			t.Fatalf("verify %s: %v", name, err)
+		}
+		rc, err := r.OpenVolume(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: data differs (err %v)", name, err)
+		}
+	}
+	if _, err := r.OpenVolume("nope"); err == nil {
+		t.Fatal("expected error for unknown volume")
+	}
+}
+
+func TestReaderDetectsCorruption(t *testing.T) {
+	path, _ := writeTestArchive(t, t.TempDir(), map[string][]byte{"vol_a": fakeTarStream(1, 50_000)})
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first entry's data starts right after its 512-byte header.
+	// Write corrupting bytes at offset 512+4, inside the first entry's zstd frame.
+	if _, err := f.WriteAt([]byte{0xff, 0xff, 0xff, 0xff}, 512+4); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if err := r.Verify("vol_a"); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected checksum mismatch, got %v", err)
+	}
+}
+
+func TestReaderRejectsForeignEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evil.tar")
+	f, _ := os.Create(path)
+	tw := tar.NewWriter(f)
+	body := []byte("x")
+	_ = tw.WriteHeader(&tar.Header{Name: "volumes/../../etc/passwd.tar.zst", Size: 1, Mode: 0o600})
+	_, _ = tw.Write(body)
+	tw.Close()
+	f.Close()
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "unexpected archive entry") {
+		t.Fatalf("expected rejection, got %v", err)
+	}
+	if _, err := Open(filepath.Join(dir, "missing.tar")); err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "garbage.tar"), []byte("not a tar at all"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(filepath.Join(dir, "garbage.tar")); err == nil {
+		t.Fatal("expected error for garbage")
+	}
+}
+
+func TestReaderRequiresManifestAndEntries(t *testing.T) {
+	dir := t.TempDir()
+	// Manifest that names a volume whose entry is absent.
+	path := filepath.Join(dir, "x.tar")
+	f, _ := os.Create(path)
+	tw := tar.NewWriter(f)
+	m := newManifest(manifest.Volume{Name: "ghost", Archive: manifest.Entry{Path: "volumes/ghost.tar.zst", SHA256: strings.Repeat("0", 64)}})
+	data, _ := m.Marshal()
+	_ = tw.WriteHeader(&tar.Header{Name: ManifestPath, Size: int64(len(data)), Mode: 0o600})
+	_, _ = tw.Write(data)
+	tw.Close()
+	f.Close()
+	if _, err := Open(path); err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("expected missing entry error, got %v", err)
+	}
+}
