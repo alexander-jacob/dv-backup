@@ -111,12 +111,20 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 	// The copy runs in its own goroutine so a cancelled ctx is not ignored
 	// while it is in flight: io.Copy itself has no notion of ctx, and
 	// h.Stdin may be a reader that blocks indefinitely (e.g. a stalled
-	// pipeline). We wait for it when it finishes on its own, but give up
-	// waiting as soon as ctx is done so a Ctrl-C during a multi-GB restore
-	// is not ignored until the whole stream has been sent. stopOnCancel
-	// above already closes attach on cancellation, which unblocks the write
-	// side (attach.Conn) promptly; a still-blocked read from h.Stdin itself
-	// is the caller's reader to abandon, not ours to wait on.
+	// pipeline). We wait for it when it finishes on its own, but on
+	// cancellation we still must not return until the goroutine has
+	// actually stopped touching h.Stdin: our only caller (restore) defers
+	// Close on the same reader right after RunHelper returns, and a
+	// goroutine still inside Read would race that Close.
+	//
+	// Contract on Helper.Stdin: a Read in progress must always return (not
+	// block forever) once its data is available or its source is
+	// exhausted - it does not need to observe ctx itself. On cancellation
+	// we close attach, which unblocks a write that is stuck on a full
+	// connection buffer; the in-flight Read then completes on its own (per
+	// the contract), the next Write fails because attach is closed, and
+	// the goroutine exits, so waiting for it here cannot hang. Callers that
+	// read from files (the only caller today) satisfy this.
 	var sendErr error
 	if h.Stdin != nil {
 		sendDone := make(chan error, 1)
@@ -130,6 +138,8 @@ func (d *Client) RunHelper(ctx context.Context, h Helper) (HelperResult, error) 
 		select {
 		case sendErr = <-sendDone: // tar may have exited early; report after we know its exit code
 		case <-ctx.Done():
+			attach.Close()
+			<-sendDone
 			sendErr = ctx.Err()
 		}
 	}

@@ -6,7 +6,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -131,10 +130,50 @@ func (w slowWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// closeRaceReader implements io.Reader with a deliberately slow but always-
+// returning Read (never EOF; sleeps readDelay then returns data), so it is
+// still in flight when ctx is cancelled shortly after RunHelper starts
+// sending it as stdin. This proves two things about RunHelper's send
+// goroutine:
+//
+//  1. Timing: RunHelper must not return before the in-flight Read finishes
+//     (i.e. it must join the send goroutine, not just stop waiting on it),
+//     so the test asserts elapsed >= readDelay.
+//  2. Memory safety: Read and Close deliberately touch the same field, n,
+//     with no synchronization between them, mirroring the real restore
+//     caller (Task 13), which defers Close on the same reader right after
+//     RunHelper returns. If the send goroutine were still inside Read at
+//     that point, `go test -race` would report a data race between it and
+//     the test's Close call.
+//
+// A correct implementation joins the goroutine before returning, so
+// RunHelper cannot return before readDelay has elapsed and Close always
+// happens strictly after the last Read.
+type closeRaceReader struct {
+	n         int
+	readDelay time.Duration
+}
+
+func (r *closeRaceReader) Read(p []byte) (int, error) {
+	time.Sleep(r.readDelay)
+	r.n++
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func (r *closeRaceReader) Close() error {
+	r.n++
+	return nil
+}
+
 // TestHelperRestoreCancellation proves that cancelling ctx while RunHelper is
-// sending stdin for a restore (io.Copy blocked forever on a stdin reader
-// that never produces data) makes RunHelper return promptly with an error,
-// and does not leave the helper container behind.
+// sending stdin for a restore makes RunHelper return promptly with an error,
+// does not leave the helper container behind, and does not leave the send
+// goroutine still reading from h.Stdin after it returns (it must have
+// observed the closed connection and exited, per the Helper.Stdin contract
+// documented in helper.go).
 func TestHelperRestoreCancellation(t *testing.T) {
 	d, err := Connect()
 	if err != nil {
@@ -147,26 +186,35 @@ func TestHelperRestoreCancellation(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = d.c.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true}) })
 
-	pr, pw := io.Pipe() // never written to: Read blocks forever
-	t.Cleanup(func() { _ = pw.Close(); _ = pr.Close() })
+	const readDelay = 1500 * time.Millisecond
+	r := &closeRaceReader{readDelay: readDelay}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond) // well before readDelay elapses
 		cancel()
 	}()
 
 	start := time.Now()
-	res, err := d.RunHelper(ctx, RestoreHelper(DefaultImage, name, pr))
+	res, err := d.RunHelper(ctx, RestoreHelper(DefaultImage, name, r))
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("expected an error after cancellation, got res=%+v", res)
 	}
-	if elapsed > 10*time.Second {
+	if elapsed < readDelay {
+		t.Fatalf("RunHelper returned after %v, before the in-flight Read (delay %v) could have finished: send goroutine was not joined", elapsed, readDelay)
+	}
+	if elapsed > readDelay+9*time.Second {
 		t.Fatalf("RunHelper took %v to return after ctx cancellation", elapsed)
 	}
 	assertNoStrayHelpers(t, d)
+
+	// Mirrors the real restore caller's defer rc.Close() right after
+	// RunHelper returns. If the send goroutine outlived RunHelper (still
+	// inside Read), this races with it on r.n and `go test -race` fails
+	// the test; see closeRaceReader's doc comment.
+	_ = r.Close()
 }
 
 // TestHelperBackupCancellation proves that cancelling ctx while RunHelper is
