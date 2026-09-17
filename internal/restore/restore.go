@@ -94,7 +94,7 @@ func Run(ctx context.Context, d dockerx.Docker, out, errOut io.Writer, opts Opti
 	}()
 	if err = st.Stop(ctx, plan.ToStop()); err != nil {
 		res.Untouched = names(plan.Steps)
-		printOutcome(out, opts.Archive, res)
+		printOutcome(out, opts, res)
 		return res, err
 	}
 
@@ -103,7 +103,7 @@ func Run(ctx context.Context, d dockerx.Docker, out, errOut io.Writer, opts Opti
 		if err = apply(ctx, d, r, opts.Image, s); err != nil {
 			res.Failed = []string{s.Volume.Name}
 			res.Untouched = names(plan.Steps[i+1:])
-			printOutcome(out, opts.Archive, res)
+			printOutcome(out, opts, res)
 			return res, err
 		}
 		res.Restored = append(res.Restored, s.Volume.Name)
@@ -116,10 +116,31 @@ func Run(ctx context.Context, d dockerx.Docker, out, errOut io.Writer, opts Opti
 // the exact command to retry the failed and untouched volumes with --force.
 // Called whenever a restore stops early, whether the failure was stopping a
 // container or applying a volume.
-func printOutcome(out io.Writer, archivePath string, res Result) {
+func printOutcome(out io.Writer, opts Options, res Result) {
 	fmt.Fprintf(out, "\nrestored:  %s\nfailed:    %s\nuntouched: %s\n", orNone(res.Restored), orNone(res.Failed), orNone(res.Untouched))
-	retry := append(append([]string{}, res.Failed...), res.Untouched...)
-	fmt.Fprintf(out, "retry with:\n  dv-backup restore --force %s %s\n", archivePath, strings.Join(retry, " "))
+	args := []string{"dv-backup", "restore", "--force"}
+	if opts.Image != dockerx.DefaultImage {
+		args = append(args, "--image", opts.Image)
+	}
+	args = append(args, opts.Archive)
+	args = append(append(args, res.Failed...), res.Untouched...)
+	for i, a := range args {
+		args[i] = shellQuote(a)
+	}
+	fmt.Fprintf(out, "retry with:\n  %s\n", strings.Join(args, " "))
+}
+
+// shellQuote returns s unchanged if it consists only of characters that are
+// safe in a POSIX shell word, and single-quoted otherwise.
+func shellQuote(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool { return !shellSafe(r) }) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func shellSafe(r rune) bool {
+	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("_-./:=@,+%", r)
 }
 
 // observe gathers the host state of one volume.

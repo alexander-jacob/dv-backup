@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -208,5 +209,41 @@ func TestRestoreCorruptArchiveChangesNothing(t *testing.T) {
 	}
 	if len(f.Calls) != 0 {
 		t.Fatalf("Docker must not be touched: %v", f.Calls)
+	}
+}
+
+func TestRestoreRetryCommandIsExact(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "my backups")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeArchive(t, dir, map[string]string{"app_db": "DB", "app_files": "FILES"})
+	const mirror = "mirror.example:5000/library/debian:13-slim"
+	f := dockerx.NewFake()
+	f.Images[mirror] = mirror + "@sha256:fake"
+	f.FailHelper["tar app_db"] = errors.New("disk on fire")
+	_, out, err := run(t, f, Options{Archive: path, Image: mirror})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	want := "dv-backup restore --force --image " + mirror + " '" + path + "' app_db app_files\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("retry command not exact, want %q in:\n%s", want, out)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	for in, want := range map[string]string{
+		"app_db":                 "app_db",
+		"/var/backups/x-1.tar":   "/var/backups/x-1.tar",
+		"debian:13-slim@sha256:": "debian:13-slim@sha256:",
+		"my backups/x.tar":       "'my backups/x.tar'",
+		"it's.tar":               `'it'\''s.tar'`,
+		"$HOME/x;rm":             "'$HOME/x;rm'",
+		"":                       "''",
+	} {
+		if got := shellQuote(in); got != want {
+			t.Errorf("shellQuote(%q) = %s, want %s", in, got, want)
+		}
 	}
 }

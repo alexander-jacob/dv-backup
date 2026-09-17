@@ -23,7 +23,7 @@ func TestUsersOf(t *testing.T) {
 	helper := c("h", dockerx.StateRunning, "v1")
 	helper.Labels = map[string]string{dockerx.LabelHelper: "true"}
 	cs := []dockerx.Container{c("b", dockerx.StateRunning, "v1", "v2"), c("a", dockerx.StatePaused, "v2"),
-		c("x", dockerx.StateExited, "v1"), c("r", dockerx.StateRestarting, "v3"), c("o", dockerx.StateRunning, "other"), helper}
+		c("x", dockerx.StateExited, "v1"), c("n", dockerx.StateCreated, "v2"), c("r", dockerx.StateRestarting, "v3"), c("o", dockerx.StateRunning, "other"), helper}
 	got := UsersOf([]string{"v1", "v2"}, cs)
 	var ids []string
 	for _, g := range got {

@@ -172,7 +172,7 @@ func (a *app) backupCmd() *cobra.Command {
 			defer d.Close()
 			opts.Names, opts.Image = args, a.image
 			res, err := backup.Run(cmd.Context(), d, a.stdout, a.stderr, opts)
-			return a.finish(res.RestartErrors, err)
+			return a.finish(cmd.Context(), res.RestartErrors, err)
 		},
 	}
 	cmd.Flags().StringVarP(&opts.OutputDir, "output", "o", ".", "output directory")
@@ -202,7 +202,7 @@ func (a *app) restoreCmd() *cobra.Command {
 				defer d.Close()
 			}
 			res, err := restore.Run(cmd.Context(), d, a.stdout, a.stderr, opts)
-			return a.finish(res.RestartErrors, err)
+			return a.finish(cmd.Context(), res.RestartErrors, err)
 		},
 	}
 	cmd.Flags().StringArrayVarP(&opts.Projects, "project", "p", nil, "only volumes of this Compose project (repeatable)")
@@ -211,12 +211,19 @@ func (a *app) restoreCmd() *cobra.Command {
 	return cmd
 }
 
+// errInterrupted replaces the low-level error (e.g. "context canceled" or a
+// closed helper connection) of an operation aborted by SIGINT or SIGTERM.
+var errInterrupted = errors.New("interrupted by signal; operation aborted")
+
 // finish maps an operation outcome to an exit code (spec §7.4).
-func (a *app) finish(restartErrs []error, err error) error {
+func (a *app) finish(ctx context.Context, restartErrs []error, err error) error {
 	for _, e := range restartErrs {
 		fmt.Fprintln(a.stderr, "error:", e)
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return fail(1, errInterrupted)
+		}
 		return fail(1, err)
 	}
 	if len(restartErrs) > 0 {

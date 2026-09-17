@@ -4,6 +4,8 @@ package integration
 
 import (
 	"bufio"
+	"bytes"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +32,8 @@ func TestSIGINTDuringBackupRestartsAndCleans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.Stderr = os.Stderr
+	var stderr bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +52,9 @@ func TestSIGINTDuringBackupRestartsAndCleans(t *testing.T) {
 	err = cmd.Wait()
 	if err == nil {
 		t.Fatal("backup should have been interrupted (if it finished, increase the fixture size)")
+	}
+	if !strings.Contains(stderr.String(), "error: interrupted") {
+		t.Fatalf("stderr does not report the interruption clearly:\n%s", stderr.String())
 	}
 	if h.state(id) != "running" {
 		t.Fatalf("container not restarted after SIGINT: %s", h.state(id))
